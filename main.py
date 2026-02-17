@@ -1192,7 +1192,7 @@ class SwingBotCommands:
 
 
 async def main():
-    TELEGRAM_TOKEN = "8034062612:AAEJYbPA8sMODYvqvt8U-5mM7c3Y3-GOYtM"
+    TELEGRAM_TOKEN = "8186622122:AAGtQcoh_s7QqIAVACmOYVHLqPX-p6dSNVA"
     TELEGRAM_CHAT_ID = "7500072234"
     
     scanner = SwingTradingScanner(
@@ -1257,3 +1257,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
