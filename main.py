@@ -213,44 +213,125 @@ class SMCGemScanner:
 
         return {'swept': False}
 
-    def detect_choch(self, df, sweep_info, lookback=20):
+    def detect_displacement_candle(self, df, sweep_info, lookback=15):
         """
-        Detect CHoCH (Change of Character) AFTER the liquidity sweep.
-        CHoCH = price makes a HIGHER HIGH after a series of lower highs.
-        This is the first sign of reversal after the sweep.
+        Detect STRONG BULLISH DISPLACEMENT CANDLE after liquidity sweep.
+        Per user strategy: Large body, above average range.
+        This is THE confirmation candle.
         """
         if not sweep_info.get('swept'):
-            return {'choch': False}
+            return {'displacement': False}
 
-        # Look at candles AFTER the sweep
-        sweep_idx = sweep_info.get('sweep_idx', len(df) - 5)
+        sweep_idx = sweep_info.get('sweep_idx', len(df) - 10)
         after_sweep = df.iloc[sweep_idx:]
 
-        if len(after_sweep) < 3:
-            return {'choch': False}
+        if len(after_sweep) < 2:
+            return {'displacement': False}
 
-        # Find if price made a higher high after sweep
-        highs = after_sweep['high'].values
-        for i in range(2, len(highs)):
-            if highs[i] > highs[i-1] and highs[i-1] > highs[i-2]:
-                # Higher highs forming = CHoCH
-                choch_price = highs[i]
-                candles_ago = len(after_sweep) - 1 - i
+        # Calculate average candle body and range
+        avg_body  = abs(df['close'] - df['open']).tail(50).mean()
+        avg_range = (df['high'] - df['low']).tail(50).mean()
+
+        # Look for strong bullish candle (large body, bullish close)
+        for i in range(len(after_sweep)):
+            candle = after_sweep.iloc[i]
+            body   = abs(candle['close'] - candle['open'])
+            rng    = candle['high'] - candle['low']
+            
+            # Must be bullish
+            is_bullish = candle['close'] > candle['open']
+            
+            # Must be large (>1.5x avg body OR >2x avg range)
+            is_large = body > avg_body * 1.5 or rng > avg_range * 2.0
+            
+            # Body should be majority of range (strong close)
+            body_pct = (body / rng * 100) if rng > 0 else 0
+            
+            if is_bullish and is_large and body_pct > 60:
                 return {
-                    'choch':       True,
-                    'choch_price': choch_price,
-                    'candles_ago': candles_ago
+                    'displacement':  True,
+                    'candle_idx':    sweep_idx + i,
+                    'candles_ago':   len(after_sweep) - 1 - i,
+                    'body_size':     body / avg_body,
+                    'range_size':    rng / avg_range,
+                    'displacement_price': candle['close']
                 }
+        
+        return {'displacement': False}
 
-        # Also check: simply if current price is above sweep low + making new high
-        if len(highs) >= 2 and highs[-1] > highs[-2]:
-            return {
-                'choch':       True,
-                'choch_price': highs[-1],
-                'candles_ago': 0
-            }
+    def detect_fvg(self, df, displacement_info, lookback=10):
+        """
+        Detect Fair Value Gap (FVG) after displacement candle.
+        FVG = gap between candle 1 high and candle 3 low (or vice versa).
+        Shows institutional fast move leaving inefficiency.
+        """
+        if not displacement_info.get('displacement'):
+            return {'fvg': False}
 
-        return {'choch': False}
+        disp_idx = displacement_info.get('candle_idx', len(df) - 5)
+        
+        # Check if there's a gap after displacement
+        if disp_idx + 3 > len(df):
+            return {'fvg': False}
+
+        # Bullish FVG: candle[i-1].high < candle[i+1].low
+        for i in range(max(disp_idx - 2, 0), min(disp_idx + 3, len(df) - 2)):
+            c1 = df.iloc[i]
+            c2 = df.iloc[i + 1]  # displacement candle potentially
+            c3 = df.iloc[i + 2]
+            
+            # Bullish FVG
+            if c1['high'] < c3['low']:
+                fvg_size = c3['low'] - c1['high']
+                fvg_pct  = fvg_size / c1['high'] * 100
+                return {
+                    'fvg':      True,
+                    'fvg_low':  c1['high'],
+                    'fvg_high': c3['low'],
+                    'fvg_size_pct': fvg_pct
+                }
+        
+        return {'fvg': False}
+
+    def detect_mss(self, df, sweep_info, lookback=50):
+        """
+        Detect MSS (Market Structure Shift).
+        MSS = Break of most recent lower high (becomes higher high).
+        This confirms trend reversal per user strategy.
+        """
+        if not sweep_info.get('swept'):
+            return {'mss': False}
+
+        sweep_idx = sweep_info.get('sweep_idx', len(df) - 10)
+        
+        # Find the most recent lower high BEFORE the sweep
+        before_sweep = df.iloc[max(0, sweep_idx - lookback):sweep_idx]
+        
+        if len(before_sweep) < 5:
+            return {'mss': False}
+
+        # Find swing highs
+        swing_highs = []
+        for i in range(3, len(before_sweep) - 3):
+            if before_sweep['high'].iloc[i] == before_sweep['high'].iloc[i-3:i+4].max():
+                swing_highs.append(before_sweep['high'].iloc[i])
+        
+        if len(swing_highs) < 2:
+            return {'mss': False}
+
+        # Most recent lower high
+        recent_lh = swing_highs[-1]
+        current   = df['close'].iloc[-1]
+        
+        # Did we break above it?
+        mss_broken = current > recent_lh
+        mss_margin = (current - recent_lh) / recent_lh * 100 if mss_broken else 0
+        
+        return {
+            'mss':        mss_broken,
+            'recent_lh':  recent_lh,
+            'mss_margin': mss_margin
+        }
 
     def detect_bos(self, df, lookback=50):
         """
@@ -390,129 +471,147 @@ class SMCGemScanner:
             # ── [5] Detect liquidity sweep ──
             sweep = self.detect_liquidity_sweep(df1h, key_level, lookback=40)
 
-            # ── [6] Detect CHoCH after sweep ──
-            choch = self.detect_choch(df1h, sweep, lookback=20)
+            # ── [6] Detect DISPLACEMENT CANDLE after sweep ──
+            displacement = self.detect_displacement_candle(df1h, sweep, lookback=15)
 
-            # ── [7] Detect BOS ──
-            bos = self.detect_bos(df1h, lookback=60)
+            # ── [7] Detect FVG (Fair Value Gap) ──
+            fvg = self.detect_fvg(df1h, displacement, lookback=10)
 
-            # ── SCORING ──
+            # ── [8] Detect MSS (Market Structure Shift) ──
+            mss = self.detect_mss(df1h, sweep, lookback=50)
+
+            # ── [9] Volume spike on displacement (optional confirmation) ──
+            volume_spike = False
+            if displacement.get('displacement'):
+                disp_idx = displacement['candle_idx']
+                if disp_idx < len(df1h):
+                    disp_candle_vol = df1h.iloc[disp_idx]['volume']
+                    avg_vol = df1h['volume'].tail(50).mean()
+                    volume_spike = disp_candle_vol > avg_vol * 1.5
+
+            # ── [10] RSI bullish divergence (optional) ──
+            rsi_divergence = False
+            if sweep.get('swept') and rsi < 40:
+                # Simple check: price made lower low but RSI higher low
+                sweep_idx = sweep['sweep_idx']
+                if sweep_idx > 10:
+                    sweep_low_price = df1h.iloc[sweep_idx]['low']
+                    sweep_low_rsi   = df1h.iloc[sweep_idx]['rsi']
+                    
+                    # Look for previous low
+                    prev_section = df1h.iloc[max(0, sweep_idx - 40):sweep_idx]
+                    if len(prev_section) > 0:
+                        prev_low_price = prev_section['low'].min()
+                        prev_low_idx   = prev_section['low'].idxmin()
+                        prev_low_rsi   = prev_section.loc[prev_low_idx, 'rsi']
+                        
+                        # Bullish divergence: lower price but higher RSI
+                        if sweep_low_price < prev_low_price and sweep_low_rsi > prev_low_rsi:
+                            rsi_divergence = True
+
+            # ── SCORING (User's Exact Strategy) ──
             score    = 0
             reasons  = []
             warnings = []
 
-            # [A] Price in Discount zone (0-20 pts) — ESSENTIAL
-            if in_discount:
-                if discount_pct > 15:
-                    score += 20
-                    reasons.append(f"🔵 DEEP DISCOUNT zone ({discount_pct:.1f}% below EQ)")
-                elif discount_pct > 5:
-                    score += 15
-                    reasons.append(f"🔵 DISCOUNT zone ({discount_pct:.1f}% below EQ)")
-                else:
-                    score += 8
-                    reasons.append(f"🔵 Near Equilibrium (slightly discounted)")
-            else:
-                # Near equilibrium is still ok
-                eq_dist = abs(current - swing_range['equilibrium']) / swing_range['equilibrium'] * 100
-                if eq_dist < 5:
-                    score += 5
-                    reasons.append(f"⚖️ Near Equilibrium ({eq_dist:.1f}% from EQ)")
+            # [A] Equal lows / multi-touch support (0-15 pts)
+            touches = key_level_info['touches']
+            if touches >= 3:
+                score += 15
+                reasons.append(f"📍 EQUAL LOWS - {touches}x touches at ${key_level:.6f}")
+            elif touches == 2:
+                score += 10
+                reasons.append(f"📍 Strong support - {touches}x touches")
+            elif touches == 1:
+                score += 5
 
-            # [B] Liquidity sweep detected (0-25 pts) — KEY SIGNAL
+            # [B] **LIQUIDITY SWEEP** (0-30 pts) — CRITICAL PER USER STRATEGY
             if sweep['swept']:
                 ca = sweep['candles_ago']
                 if ca <= 5:
-                    score += 25
-                    reasons.append(f"💥 FRESH LIQUIDITY SWEEP ({ca} candles ago, -{sweep['sweep_depth']:.1f}%)")
+                    score += 30
+                    reasons.append(f"💥 LIQUIDITY SWEEP! ({ca}h ago, -{sweep['sweep_depth']:.1f}%) ✅")
                 elif ca <= 12:
-                    score += 18
-                    reasons.append(f"💥 Liquidity sweep ({ca} candles ago)")
+                    score += 22
+                    reasons.append(f"💥 Liquidity sweep ({ca}h ago)")
                 elif ca <= 20:
-                    score += 10
-                    reasons.append(f"💥 Recent sweep ({ca} candles ago)")
+                    score += 12
+                    reasons.append(f"💥 Recent sweep ({ca}h ago)")
             else:
-                # Check if current price is just AT key level (about to sweep)
-                dist_to_key = (current - key_level) / key_level * 100
-                if 0 <= dist_to_key < 1.5:
-                    score += 8
-                    reasons.append(f"⚡ Price AT key level (sweep imminent?)")
+                # Penalty if no sweep yet
+                warnings.append("⚠️ No liquidity sweep detected yet")
+                score -= 10
 
-            # [C] CHoCH detected (0-20 pts) — CONFIRMS REVERSAL
-            if choch['choch']:
-                ca = choch.get('candles_ago', 5)
-                if ca <= 3:
-                    score += 20
-                    reasons.append(f"🔄 FRESH CHoCH - Trend reversal confirmed!")
-                elif ca <= 8:
-                    score += 15
-                    reasons.append(f"🔄 CHoCH confirmed ({ca} candles ago)")
+            # [C] **DISPLACEMENT CANDLE** (0-25 pts) — USER STRATEGY RULE #3
+            if displacement['displacement']:
+                body_mult  = displacement['body_size']
+                range_mult = displacement['range_size']
+                score += 25
+                reasons.append(f"🚀 DISPLACEMENT CANDLE! ({body_mult:.1f}x body, {range_mult:.1f}x range) ✅")
+            else:
+                warnings.append("⚠️ No displacement candle after sweep")
+                score -= 8
+
+            # [D] **MSS (Market Structure Shift)** (0-25 pts) — USER STRATEGY RULE #4
+            if mss['mss']:
+                score += 25
+                reasons.append(f"📈 MSS CONFIRMED! Broke lower high by +{mss['mss_margin']:.1f}% ✅")
+            else:
+                warnings.append("⚠️ MSS not confirmed - structure not shifted yet")
+                score -= 10
+
+            # [E] Price in Discount (0-10 pts)
+            if in_discount:
+                if discount_pct > 10:
+                    score += 10
+                    reasons.append(f"🔵 Deep discount ({discount_pct:.1f}% below EQ)")
                 else:
-                    score += 8
-                    reasons.append(f"🔄 CHoCH present")
+                    score += 6
+                    reasons.append(f"🔵 Discount zone")
 
-            # [D] Prior downtrend (0-15 pts) — CONTEXT
+            # [F] **VOLUME SPIKE** on displacement (0-10 pts) — USER OPTIONAL CONFIRMATION
+            if volume_spike:
+                score += 10
+                reasons.append(f"📊 VOLUME SPIKE on displacement ✅")
+
+            # [G] **RSI DIVERGENCE** (0-10 pts) — USER OPTIONAL CONFIRMATION
+            if rsi_divergence:
+                score += 10
+                reasons.append(f"📈 RSI BULLISH DIVERGENCE ✅")
+            elif rsi < 35:
+                score += 6
+                reasons.append(f"💎 RSI oversold ({rsi:.0f})")
+
+            # [H] **FVG (Fair Value Gap)** (0-10 pts) — USER OPTIONAL CONFIRMATION
+            if fvg['fvg']:
+                score += 10
+                reasons.append(f"⚡ FVG DETECTED ({fvg['fvg_size_pct']:.1f}% gap) ✅")
+
+            # [I] Prior downtrend (0-10 pts)
             if trend_info['is_downtrend']:
                 drop = abs(trend_info['price_drop_pct'])
-                if drop > 30:
-                    score += 15
-                    reasons.append(f"📉 Strong downtrend before reversal (-{drop:.0f}%)")
-                elif drop > 15:
+                if drop > 25:
                     score += 10
-                    reasons.append(f"📉 Downtrend present (-{drop:.0f}%)")
+                    reasons.append(f"📉 Strong downtrend before (-{drop:.0f}%)")
                 else:
                     score += 5
-            elif trend_info['price_drop_pct'] < -10:
-                score += 8
-                reasons.append(f"📉 Price dropped ({abs(trend_info['price_drop_pct']):.0f}% from recent high)")
 
-            # [E] BOS (Break of Structure) (0-15 pts) — FINAL CONFIRMATION
-            if bos['bos']:
-                score += 15
-                reasons.append(f"✅ BOS - Structure broken bullish (+{bos['bos_margin']:.1f}%)")
-
-            # [F] RSI position (0-10 pts)
-            if rsi < 35:
-                score += 10
-                reasons.append(f"💎 RSI oversold ({rsi:.0f}) — bounce fuel ready")
-            elif rsi < 45:
-                score += 7
-                reasons.append(f"💎 RSI low ({rsi:.0f}) — healthy for bounce")
-            elif rsi < 55:
-                score += 4
-
-            # [G] Volume surge on recent candle (0-10 pts)
-            vol_ratio = float(l1h.get('vol_ratio', 1) or 1)
-            if vol_ratio > 2.0:
-                score += 10
-                reasons.append(f"📊 HIGH VOLUME ({vol_ratio:.1f}x) — institutional activity")
-            elif vol_ratio > 1.3:
-                score += 5
-                reasons.append(f"📊 Above avg volume ({vol_ratio:.1f}x)")
-
-            # [H] 4H context (0-10 pts)
+            # [J] 4H context (0-5 pts)
             try:
-                e20_4h = float(l4h.get('ema_20', 0) or 0)
-                e50_4h = float(l4h.get('ema_50', 0) or 0)
                 rsi_4h = float(l4h.get('rsi', 50) or 50)
                 if rsi_4h < 40:
-                    score += 10
-                    reasons.append(f"💎 4H RSI oversold ({rsi_4h:.0f}) — bigger picture supports bounce")
-                elif rsi_4h < 50:
                     score += 5
+                    reasons.append(f"💎 4H RSI oversold ({rsi_4h:.0f})")
             except Exception:
                 pass
 
             # ── WARNINGS ──
             if rsi > 65:
-                warnings.append("⚠️ RSI elevated on 1H — momentum may stall")
+                warnings.append("⚠️ RSI high on 1H")
                 score -= 8
-            if not sweep['swept'] and not choch['choch']:
-                warnings.append("⚠️ No sweep or CHoCH yet — wait for confirmation")
-                score -= 10
-            if current > swing_range['equilibrium'] * 1.05:
-                warnings.append("⚠️ Price above equilibrium — not ideal discount entry")
-                score -= 10
+            if current > swing_range['premium_start']:
+                warnings.append("⚠️ Price in premium - not discount entry")
+                score -= 15
 
             if score < self.min_score_threshold:
                 return None
@@ -569,11 +668,13 @@ class SMCGemScanner:
                 'warnings':      warnings,
                 'swing_range':   swing_range,
                 'sweep':         sweep,
-                'choch':         choch,
-                'bos':           bos,
+                'displacement':  displacement,
+                'mss':           mss,
+                'fvg':           fvg,
                 'trend':         trend_info,
                 'rsi':           rsi,
-                'vol_ratio':     vol_ratio,
+                'rsi_divergence': rsi_divergence,
+                'volume_spike':  volume_spike,
                 'timestamp':     datetime.now()
             }
 
@@ -611,22 +712,35 @@ class SMCGemScanner:
             pct_disc = (sr['equilibrium'] - r['entry']) / sr['equilibrium'] * 100
             msg += f" 🔵 DISCOUNT ({pct_disc:.1f}% below EQ)\n\n"
 
-        # Sweep & CHoCH status
-        msg += f"<b>🔍 SMC SIGNALS:</b>\n"
+        # Sweep & Confirmations status
+        msg += f"<b>🎯 STRATEGY CONFIRMATIONS:</b>\n"
+        
+        # Rule 1 & 2: Equal lows + Liquidity sweep
         if r['sweep']['swept']:
-            msg += f"  💥 Liq. Sweep: ✅ ({r['sweep']['candles_ago']}h ago, -{r['sweep']['sweep_depth']:.1f}%)\n"
+            msg += f"  ✅ Liquidity Sweep ({r['sweep']['candles_ago']}h ago)\n"
         else:
-            msg += f"  💥 Liq. Sweep: ⏳ Watching...\n"
+            msg += f"  ⏳ Liquidity Sweep - waiting\n"
 
-        if r['choch']['choch']:
-            msg += f"  🔄 CHoCH:      ✅ Confirmed\n"
+        # Rule 3: Displacement candle
+        if r['displacement']['displacement']:
+            msg += f"  ✅ Displacement Candle ({r['displacement']['body_size']:.1f}x body)\n"
         else:
-            msg += f"  🔄 CHoCH:      ⏳ Not yet\n"
+            msg += f"  ⏳ Displacement Candle - waiting\n"
 
-        if r['bos']['bos']:
-            msg += f"  📈 BOS:        ✅ Broken (+{r['bos']['bos_margin']:.1f}%)\n"
+        # Rule 4: MSS
+        if r['mss']['mss']:
+            msg += f"  ✅ MSS (Market Structure Shift)\n"
         else:
-            msg += f"  📈 BOS:        ⏳ Watching\n"
+            msg += f"  ⏳ MSS - waiting\n"
+
+        # Optional confirmations
+        msg += f"\n<b>💎 OPTIONAL CONFIRMATIONS:</b>\n"
+        if r.get('volume_spike'):
+            msg += f"  ✅ Volume Spike\n"
+        if r.get('rsi_divergence'):
+            msg += f"  ✅ RSI Bullish Divergence\n"
+        if r['fvg']['fvg']:
+            msg += f"  ✅ Fair Value Gap ({r['fvg']['fvg_size_pct']:.1f}%)\n"
 
         msg += f"\n<b>💰 TRADE:</b>\n"
         msg += f"  Entry: ${r['entry']:.6f}\n"
