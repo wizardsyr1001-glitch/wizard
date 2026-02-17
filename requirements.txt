@@ -5,3 +5,4 @@ numpy
 asyncio
 aiohttp
 python-dotenv
+ta
