@@ -16,25 +16,36 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
-class SMC15MinScanner:
+class EquilibriumRetestScanner:
     """
-    💎 15-MINUTE SMC SCANNER
+    💎 EQUILIBRIUM RETEST SCANNER
     
-    THE ACTUAL STRATEGY from @free_fx_pro (BAN 15min chart confirmed):
+    THE EXACT PATTERN from @free_fx_pro (BAN, ESP, WLFI, KITE confirmed):
     
-    TIMEFRAME: 15 MINUTE (not 1H!)
+    ══════════════════════════════════════════════════════════════
+    LONG SETUP (what we see in ALL 4 screenshots):
+    ══════════════════════════════════════════════════════════════
     
-    FULL SMC METHODOLOGY:
-    1. Map Premium / Equilibrium / Discount zones
-    2. Detect liquidity sweeps (sellside/buyside)
-    3. Identify CHoCH (Change of Character) - first sign of reversal
-    4. Confirm BOS (Break of Structure) - trend change confirmed
-    5. Find order blocks (last down candle before move up)
-    6. Enter in discount on pullback to order block
-    7. SL below sweep low
-    8. TP at premium zone / previous high
+    1. Price falls from PREMIUM (red zone) → crosses EQUILIBRIUM (yellow line)
+    2. Price enters DISCOUNT zone (blue zone)
+    3. Price RETESTS equilibrium 2-3 times from below
+       - Each retest = price touches EQ but gets rejected back down
+       - This confirms EQ is strong resistance
+    4. Price HOLDS in discount zone (doesn't break back up)
+    5. 🚀 ENTRY LONG in discount - target back to EQ/Premium
     
-    SCAN FREQUENCY: Every 5-10 minutes (FAST for 15min timeframe)
+    ══════════════════════════════════════════════════════════════
+    SHORT SETUP (opposite):
+    ══════════════════════════════════════════════════════════════
+    
+    1. Price rises from DISCOUNT → crosses EQUILIBRIUM
+    2. Price enters PREMIUM zone
+    3. Price retests EQ 2-3 times from above
+    4. Price holds in premium
+    5. 🚀 ENTRY SHORT in premium - target back to EQ/Discount
+    
+    TIMEFRAME: 15 minute
+    SCAN FREQUENCY: Every 5 minutes (to catch retests quickly)
     """
 
     def __init__(self, telegram_token, telegram_chat_id,
@@ -49,11 +60,11 @@ class SMC15MinScanner:
             'options': {'defaultType': 'future'}
         })
 
-        # FAST SCANNING for 15min timeframe
-        self.scan_interval        = 600    # 10 minutes
+        # Fast scanning for 15min timeframe
+        self.scan_interval        = 300    # 5 minutes (to catch retests)
         self.min_score_threshold  = 70
         self.max_alerts_per_scan  = 10
-        self.price_check_interval = 60     # 1 minute
+        self.price_check_interval = 60
 
         self.alerted_pairs  = {}
         self.active_trades  = {}
@@ -95,8 +106,9 @@ class SMC15MinScanner:
                         'volume': float(market.get('info', {}).get('volume', 0) or 0)
                     })
             perps.sort(key=lambda x: x['volume'], reverse=True)
-            self.pairs_to_scan = [p['base'] for p in perps[:150]]  # Top 150 only
-            self.all_symbols   = [p['symbol'] for p in perps[:150]]
+            # Top 120 pairs - quality focus
+            self.pairs_to_scan = [p['base'] for p in perps[:120]]
+            self.all_symbols   = [p['symbol'] for p in perps[:120]]
             logger.info(f"Loaded {len(self.pairs_to_scan)} pairs")
             return True
         except Exception as e:
@@ -113,189 +125,235 @@ class SMC15MinScanner:
     async def fetch_data(self, symbol):
         try:
             data = {}
-            # 15min primary + 1H for context
-            data['15m'] = await self.fetch_df(symbol, '15m', 300)
-            await asyncio.sleep(0.03)
+            data['15m'] = await self.fetch_df(symbol, '15m', 200)
+            await asyncio.sleep(0.04)
             data['1h']  = await self.fetch_df(symbol, '1h', 100)
-            await asyncio.sleep(0.03)
+            await asyncio.sleep(0.04)
             return data
         except Exception as e:
             logger.error(f"Fetch {symbol}: {e}")
             return None
 
     # ─────────────────────────────────────────────────
-    # SMC CORE FUNCTIONS (15min optimized)
+    # CORE: EQUILIBRIUM & ZONE DETECTION
     # ─────────────────────────────────────────────────
 
-    def map_premium_discount(self, df, lookback=200):
-        """Map Premium/Equilibrium/Discount zones on 15min."""
+    def calculate_zones(self, df, lookback=150):
+        """
+        Calculate Premium / Equilibrium / Discount zones.
+        This is what creates the red/yellow/blue zones in his charts.
+        """
         recent = df.tail(lookback)
+        
         swing_high = recent['high'].max()
         swing_low  = recent['low'].min()
-        eq = (swing_high + swing_low) / 2
         
+        # Equilibrium = 50% of range
+        equilibrium = (swing_high + swing_low) / 2
+        
+        # Premium zone = top 25%
         range_size = swing_high - swing_low
-        premium_start   = swing_high - (range_size * 0.25)
-        discount_end    = swing_low  + (range_size * 0.25)
+        premium_start = swing_high - (range_size * 0.25)
+        
+        # Discount zone = bottom 25%
+        discount_end = swing_low + (range_size * 0.25)
         
         return {
-            'swing_high': swing_high, 'swing_low': swing_low,
-            'equilibrium': eq, 'premium_start': premium_start,
-            'discount_end': discount_end, 'range_size': range_size
+            'swing_high':    swing_high,
+            'swing_low':     swing_low,
+            'equilibrium':   equilibrium,
+            'premium_start': premium_start,
+            'discount_end':  discount_end,
+            'range_size':    range_size
         }
 
-    def find_structure_points(self, df, window=10):
-        """Find swing highs and swing lows for structure."""
-        highs, lows = [], []
-        
-        for i in range(window, len(df) - window):
-            # Swing high
-            if df['high'].iloc[i] == df['high'].iloc[i-window:i+window+1].max():
-                highs.append({'idx': i, 'price': df['high'].iloc[i]})
-            # Swing low
-            if df['low'].iloc[i] == df['low'].iloc[i-window:i+window+1].min():
-                lows.append({'idx': i, 'price': df['low'].iloc[i]})
-        
-        return {'highs': highs, 'lows': lows}
-
-    def detect_liquidity_sweep(self, df, structure, lookback=80):
+    def detect_eq_cross_to_discount(self, df, zones, lookback=50):
         """
-        Detect LIQUIDITY SWEEP on 15min.
-        = Price wicks below recent swing low then closes back above.
+        Detect when price crossed FROM premium INTO discount.
+        This is step 1 of the pattern.
         """
-        lows = structure['lows']
-        if not lows:
-            return {'swept': False}
+        eq = zones['equilibrium']
+        recent = df.tail(lookback)
         
-        # Find most recent swing low
-        recent_lows = [l for l in lows if l['idx'] > len(df) - lookback]
-        if not recent_lows:
-            return {'swept': False}
-        
-        # Get the lowest swing low as key level
-        key_low = min(recent_lows, key=lambda x: x['price'])
-        key_price = key_low['price']
-        key_idx = key_low['idx']
-        
-        # Check candles AFTER this low for sweep
-        after = df.iloc[key_idx:]
-        
-        for i in range(len(after)):
-            candle = after.iloc[i]
-            # Sweep = wick below then close above
-            if candle['low'] < key_price * 0.997 and candle['close'] > key_price * 1.002:
-                candles_ago = len(df) - 1 - (key_idx + i)
-                return {
-                    'swept': True,
-                    'sweep_low': candle['low'],
-                    'key_level': key_price,
-                    'sweep_depth': (key_price - candle['low']) / key_price * 100,
-                    'candles_ago': candles_ago,
-                    'sweep_idx': key_idx + i
-                }
-        
-        return {'swept': False}
-
-    def detect_choch(self, df, structure, sweep_info):
-        """
-        Detect CHoCH (Change of Character) on 15min.
-        = After downtrend, price makes HIGHER HIGH.
-        First sign of reversal.
-        """
-        if not sweep_info.get('swept'):
-            return {'choch': False}
-        
-        sweep_idx = sweep_info.get('sweep_idx', len(df) - 20)
-        highs = structure['highs']
-        
-        # Get highs BEFORE sweep
-        highs_before = [h for h in highs if h['idx'] < sweep_idx]
-        if len(highs_before) < 2:
-            return {'choch': False}
-        
-        # Recent high before sweep
-        recent_high_before = highs_before[-1]['price']
-        
-        # Check if price after sweep made HIGHER high
-        after_sweep = df.iloc[sweep_idx:]
-        highest_after = after_sweep['high'].max()
-        
-        if highest_after > recent_high_before * 1.003:  # 0.3% buffer
-            candles_ago = len(df) - 1 - after_sweep['high'].idxmax()
-            return {
-                'choch': True,
-                'choch_high': highest_after,
-                'broke_high': recent_high_before,
-                'candles_ago': candles_ago
-            }
-        
-        return {'choch': False}
-
-    def detect_bos(self, df, structure, choch_info):
-        """
-        Detect BOS (Break of Structure) on 15min.
-        = Confirms new uptrend by breaking ANOTHER high.
-        """
-        if not choch_info.get('choch'):
-            return {'bos': False}
-        
-        highs = structure['highs']
-        if len(highs) < 3:
-            return {'bos': False}
-        
-        # Check if recent price broke multiple highs
-        current = df['close'].iloc[-1]
-        recent_high = highs[-1]['price'] if highs else current * 0.9
-        
-        bos_broken = current > recent_high
-        
-        return {
-            'bos': bos_broken,
-            'bos_level': recent_high if bos_broken else None
-        }
-
-    def find_order_block(self, df, sweep_info):
-        """
-        Find ORDER BLOCK on 15min.
-        = Last bearish candle before bullish move.
-        This is where smart money bought.
-        """
-        if not sweep_info.get('swept'):
-            return {'ob': False}
-        
-        sweep_idx = sweep_info.get('sweep_idx', len(df) - 10)
-        
-        # Look for last red candle before the move up
-        after_sweep = df.iloc[sweep_idx:sweep_idx + 20]
-        
-        for i in range(len(after_sweep) - 1):
-            current = after_sweep.iloc[i]
-            next_candle = after_sweep.iloc[i + 1]
+        # Find the cross point
+        cross_idx = None
+        for i in range(len(recent) - 1):
+            prev_close = recent['close'].iloc[i]
+            curr_close = recent['close'].iloc[i + 1]
             
-            # Red candle followed by green candle
-            if (current['close'] < current['open'] and 
-                next_candle['close'] > next_candle['open']):
-                
-                ob_high = current['high']
-                ob_low  = current['low']
-                ob_mid  = (ob_high + ob_low) / 2
-                
-                return {
-                    'ob': True,
-                    'ob_high': ob_high,
-                    'ob_low': ob_low,
-                    'ob_mid': ob_mid,
-                    'ob_idx': sweep_idx + i
-                }
+            # Crossed from above EQ to below EQ
+            if prev_close > eq and curr_close < eq:
+                cross_idx = i + 1
+                break
         
-        return {'ob': False}
+        if cross_idx is None:
+            return {'crossed': False}
+        
+        # How long ago was the cross?
+        candles_since_cross = len(recent) - 1 - cross_idx
+        
+        return {
+            'crossed': True,
+            'cross_idx': cross_idx,
+            'candles_ago': candles_since_cross,
+            'cross_price': recent['close'].iloc[cross_idx]
+        }
+
+    def detect_eq_cross_to_premium(self, df, zones, lookback=50):
+        """
+        Detect when price crossed FROM discount INTO premium.
+        For SHORT setups.
+        """
+        eq = zones['equilibrium']
+        recent = df.tail(lookback)
+        
+        cross_idx = None
+        for i in range(len(recent) - 1):
+            prev_close = recent['close'].iloc[i]
+            curr_close = recent['close'].iloc[i + 1]
+            
+            # Crossed from below EQ to above EQ
+            if prev_close < eq and curr_close > eq:
+                cross_idx = i + 1
+                break
+        
+        if cross_idx is None:
+            return {'crossed': False}
+        
+        candles_since_cross = len(recent) - 1 - cross_idx
+        
+        return {
+            'crossed': True,
+            'cross_idx': cross_idx,
+            'candles_ago': candles_since_cross,
+            'cross_price': recent['close'].iloc[cross_idx]
+        }
+
+    def count_eq_retests_from_discount(self, df, zones, cross_info):
+        """
+        Count how many times price RETESTED equilibrium from discount side.
+        
+        THIS IS THE KEY PATTERN!
+        
+        A retest = price came UP from discount, touched/approached EQ,
+                   but got REJECTED back down into discount.
+        
+        From screenshots: we see 2-3 clear retests before the pump.
+        """
+        if not cross_info['crossed']:
+            return {'retests': 0, 'retest_points': []}
+        
+        eq = zones['equilibrium']
+        cross_idx = cross_info['cross_idx']
+        
+        # Look at candles AFTER the cross into discount
+        after_cross = df.iloc[cross_idx:]
+        
+        retests = []
+        eq_tolerance = eq * 0.015  # Within 1.5% of EQ counts as touch
+        
+        for i in range(1, len(after_cross)):
+            candle = after_cross.iloc[i]
+            prev_candle = after_cross.iloc[i-1]
+            
+            # Check if this candle tested EQ from below
+            # Retest = high came near/touched EQ but close stayed below
+            if (candle['high'] >= eq - eq_tolerance and 
+                candle['close'] < eq):
+                
+                # Make sure it came from below (previous candle was lower)
+                if prev_candle['close'] < eq - eq_tolerance:
+                    retests.append({
+                        'idx': cross_idx + i,
+                        'high': candle['high'],
+                        'close': candle['close'],
+                        'distance_from_eq': (eq - candle['high']) / eq * 100
+                    })
+        
+        # Remove duplicate retests (consecutive candles touching EQ count as 1)
+        clean_retests = []
+        if retests:
+            clean_retests.append(retests[0])
+            for rt in retests[1:]:
+                # Only add if it's at least 3 candles away from last retest
+                if rt['idx'] - clean_retests[-1]['idx'] >= 3:
+                    clean_retests.append(rt)
+        
+        return {
+            'retests': len(clean_retests),
+            'retest_points': clean_retests
+        }
+
+    def count_eq_retests_from_premium(self, df, zones, cross_info):
+        """
+        Count retests from premium side (for SHORT setups).
+        Opposite logic.
+        """
+        if not cross_info['crossed']:
+            return {'retests': 0, 'retest_points': []}
+        
+        eq = zones['equilibrium']
+        cross_idx = cross_info['cross_idx']
+        
+        after_cross = df.iloc[cross_idx:]
+        retests = []
+        eq_tolerance = eq * 0.015
+        
+        for i in range(1, len(after_cross)):
+            candle = after_cross.iloc[i]
+            prev_candle = after_cross.iloc[i-1]
+            
+            # Retest from above = low came near EQ but close stayed above
+            if (candle['low'] <= eq + eq_tolerance and 
+                candle['close'] > eq):
+                
+                if prev_candle['close'] > eq + eq_tolerance:
+                    retests.append({
+                        'idx': cross_idx + i,
+                        'low': candle['low'],
+                        'close': candle['close'],
+                        'distance_from_eq': (candle['low'] - eq) / eq * 100
+                    })
+        
+        clean_retests = []
+        if retests:
+            clean_retests.append(retests[0])
+            for rt in retests[1:]:
+                if rt['idx'] - clean_retests[-1]['idx'] >= 3:
+                    clean_retests.append(rt)
+        
+        return {
+            'retests': len(clean_retests),
+            'retest_points': clean_retests
+        }
+
+    def check_holding_in_zone(self, df, zones, cross_info, zone_type='discount'):
+        """
+        Check if price is HOLDING in the zone (not breaking back through EQ).
+        This confirms the setup is still valid.
+        """
+        if not cross_info['crossed']:
+            return False
+        
+        eq = zones['equilibrium']
+        
+        # Check last 5-10 candles
+        recent = df.tail(10)
+        
+        if zone_type == 'discount':
+            # Should be holding BELOW equilibrium
+            closes_below = sum(1 for c in recent['close'] if c < eq)
+            return closes_below >= 7  # At least 7 of last 10 candles below EQ
+        else:  # premium
+            # Should be holding ABOVE equilibrium
+            closes_above = sum(1 for c in recent['close'] if c > eq)
+            return closes_above >= 7
 
     def add_indicators(self, df):
         if len(df) < 50:
             return df
         try:
             df['ema_20']    = ta.trend.EMAIndicator(df['close'], window=20).ema_indicator()
-            df['ema_50']    = ta.trend.EMAIndicator(df['close'], window=50).ema_indicator()
             df['rsi']       = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
             df['vol_sma']   = df['volume'].rolling(20).mean()
             df['vol_ratio'] = df['volume'] / df['vol_sma'].replace(0, 1)
@@ -306,11 +364,14 @@ class SMC15MinScanner:
         return df
 
     # ─────────────────────────────────────────────────
-    # MAIN ANALYSIS (15MIN)
+    # MAIN ANALYSIS
     # ─────────────────────────────────────────────────
 
-    def analyze_smc_15m(self, data, symbol):
-        """Full 15min SMC analysis."""
+    def analyze_eq_retest(self, data, symbol):
+        """
+        Full equilibrium retest analysis.
+        Detects BOTH long and short setups.
+        """
         try:
             if not data or '15m' not in data:
                 return None
@@ -318,145 +379,200 @@ class SMC15MinScanner:
             df15m = self.add_indicators(data['15m'].copy())
             df1h  = self.add_indicators(data['1h'].copy())
 
-            if len(df15m) < 100:
+            if len(df15m) < 80:
                 return None
 
             current = df15m['close'].iloc[-1]
             l15m    = df15m.iloc[-1]
             l1h     = df1h.iloc[-1]
             rsi     = float(l15m.get('rsi', 50) or 50)
+            rsi_1h  = float(l1h.get('rsi', 50) or 50)
             volr    = float(l15m.get('vol_ratio', 1) or 1)
 
-            # ── [1] Map zones ──
-            zones = self.map_premium_discount(df15m, lookback=200)
+            # ── [1] Calculate zones ──
+            zones = self.calculate_zones(df15m, lookback=150)
 
-            # ── [2] Find structure ──
-            structure = self.find_structure_points(df15m, window=8)
+            # ── [2] Check for LONG setup (discount) ──
+            cross_to_discount = self.detect_eq_cross_to_discount(df15m, zones, lookback=60)
+            
+            long_setup = None
+            if cross_to_discount['crossed']:
+                # Count retests from discount
+                retests_discount = self.count_eq_retests_from_discount(
+                    df15m, zones, cross_to_discount)
+                
+                # Check if holding in discount
+                holding_discount = self.check_holding_in_zone(
+                    df15m, zones, cross_to_discount, 'discount')
+                
+                if retests_discount['retests'] >= 2 and holding_discount:
+                    long_setup = {
+                        'signal': 'LONG',
+                        'cross': cross_to_discount,
+                        'retests': retests_discount,
+                        'holding': holding_discount
+                    }
 
-            # ── [3] Liquidity sweep ──
-            sweep = self.detect_liquidity_sweep(df15m, structure, lookback=100)
+            # ── [3] Check for SHORT setup (premium) ──
+            cross_to_premium = self.detect_eq_cross_to_premium(df15m, zones, lookback=60)
+            
+            short_setup = None
+            if cross_to_premium['crossed']:
+                retests_premium = self.count_eq_retests_from_premium(
+                    df15m, zones, cross_to_premium)
+                
+                holding_premium = self.check_holding_in_zone(
+                    df15m, zones, cross_to_premium, 'premium')
+                
+                if retests_premium['retests'] >= 2 and holding_premium:
+                    short_setup = {
+                        'signal': 'SHORT',
+                        'cross': cross_to_premium,
+                        'retests': retests_premium,
+                        'holding': holding_premium
+                    }
 
-            # ── [4] CHoCH ──
-            choch = self.detect_choch(df15m, structure, sweep)
+            # Pick the better setup (or both if both exist)
+            setup = None
+            if long_setup and not short_setup:
+                setup = long_setup
+            elif short_setup and not long_setup:
+                setup = short_setup
+            elif long_setup and short_setup:
+                # Both exist - pick the one with more retests
+                if long_setup['retests']['retests'] >= short_setup['retests']['retests']:
+                    setup = long_setup
+                else:
+                    setup = short_setup
 
-            # ── [5] BOS ──
-            bos = self.detect_bos(df15m, structure, choch)
+            if not setup:
+                return None
 
-            # ── [6] Order block ──
-            ob = self.find_order_block(df15m, sweep)
-
-            # ── [7] Check if price in discount ──
-            in_discount = current < zones['equilibrium']
-            dist_pct = (zones['equilibrium'] - current) / zones['equilibrium'] * 100 if in_discount else 0
-
-            # ── SCORING (15min optimized) ──
-            score = 0
-            reasons = []
+            # ── SCORING ──
+            score    = 0
+            reasons  = []
             warnings = []
+            signal   = setup['signal']
 
-            # [A] Liquidity sweep (0-35 pts) - CRITICAL
-            if sweep['swept']:
-                ca = sweep['candles_ago']
-                if ca <= 10:  # Within 2.5 hours on 15min
-                    score += 35
-                    reasons.append(f"💥 LIQUIDITY SWEEP! ({ca}x15min ago, -{sweep['sweep_depth']:.1f}%)")
-                elif ca <= 20:
-                    score += 25
-                    reasons.append(f"💥 Liquidity sweep ({ca}x15min ago)")
-                else:
-                    score += 12
-            else:
-                warnings.append("⚠️ No liquidity sweep detected")
-                score -= 15
+            # [A] Number of retests (0-40 pts) - MOST IMPORTANT
+            num_retests = setup['retests']['retests']
+            if num_retests >= 4:
+                score += 40
+                reasons.append(f"🎯 {num_retests} EQ RETESTS - Perfect setup!")
+            elif num_retests == 3:
+                score += 35
+                reasons.append(f"🎯 {num_retests} EQ retests - Strong!")
+            elif num_retests == 2:
+                score += 25
+                reasons.append(f"🎯 {num_retests} EQ retests - Good")
 
-            # [B] CHoCH (0-30 pts) - REVERSAL SIGNAL
-            if choch['choch']:
-                score += 30
-                reasons.append(f"🔄 CHoCH CONFIRMED - Trend reversing!")
-            else:
-                warnings.append("⚠️ No CHoCH - reversal not confirmed")
-                score -= 10
+            # [B] Holding in zone (0-25 pts)
+            if setup['holding']:
+                score += 25
+                zone_name = "DISCOUNT" if signal == 'LONG' else "PREMIUM"
+                reasons.append(f"📍 HOLDING in {zone_name} zone")
 
-            # [C] BOS (0-20 pts) - STRUCTURE BREAK
-            if bos['bos']:
+            # [C] Time since cross (0-20 pts) - prefer recent crosses
+            candles_ago = setup['cross']['candles_ago']
+            if candles_ago <= 15:  # Within ~4 hours
                 score += 20
-                reasons.append(f"📈 BOS - Structure broken bullish!")
+                reasons.append(f"⏱️ Fresh cross ({candles_ago}x15min ago)")
+            elif candles_ago <= 25:
+                score += 12
+                reasons.append(f"⏱️ Recent cross ({candles_ago}x15min ago)")
+            else:
+                score += 5
+                warnings.append(f"⚠️ Cross was {candles_ago}x15min ago - getting old")
 
-            # [D] Order block (0-15 pts)
-            if ob['ob']:
-                score += 15
-                # Check if price near OB
-                dist_to_ob = abs(current - ob['ob_mid']) / ob['ob_mid'] * 100
-                if dist_to_ob < 1:
-                    score += 5
-                    reasons.append(f"📦 AT ORDER BLOCK - prime entry zone!")
-                else:
-                    reasons.append(f"📦 Order block identified")
-
-            # [E] Discount zone (0-15 pts)
-            if in_discount:
-                if dist_pct > 10:
+            # [D] RSI alignment (0-15 pts)
+            if signal == 'LONG':
+                if rsi < 35:
                     score += 15
-                    reasons.append(f"🔵 Deep discount ({dist_pct:.1f}% below EQ)")
-                elif dist_pct > 3:
+                    reasons.append(f"💎 RSI oversold ({rsi:.0f}) - bounce ready")
+                elif rsi < 45:
                     score += 10
-                    reasons.append(f"🔵 In discount zone")
+                    reasons.append(f"💎 RSI low ({rsi:.0f})")
+                elif rsi > 60:
+                    warnings.append(f"⚠️ RSI high ({rsi:.0f}) for long")
+                    score -= 10
+            else:  # SHORT
+                if rsi > 65:
+                    score += 15
+                    reasons.append(f"💎 RSI overbought ({rsi:.0f}) - drop ready")
+                elif rsi > 55:
+                    score += 10
+                    reasons.append(f"💎 RSI high ({rsi:.0f})")
+                elif rsi < 40:
+                    warnings.append(f"⚠️ RSI low ({rsi:.0f}) for short")
+                    score -= 10
 
-            # [F] RSI (0-10 pts)
-            if rsi < 35:
+            # [E] Volume (0-10 pts)
+            if volr > 1.5:
                 score += 10
-                reasons.append(f"💎 RSI oversold ({rsi:.0f})")
-            elif rsi < 45:
-                score += 6
-
-            # [G] Volume (0-10 pts)
-            if volr > 2.0:
-                score += 10
-                reasons.append(f"📊 High volume ({volr:.1f}x)")
-            elif volr > 1.5:
+                reasons.append(f"📊 Strong volume ({volr:.1f}x)")
+            elif volr > 1.0:
                 score += 5
 
-            # [H] 1H context (0-10 pts)
-            rsi_1h = float(l1h.get('rsi', 50) or 50)
-            if rsi_1h < 40:
+            # [F] 1H RSI context (0-10 pts)
+            if signal == 'LONG' and rsi_1h < 40:
                 score += 10
                 reasons.append(f"💎 1H RSI oversold ({rsi_1h:.0f})")
+            elif signal == 'SHORT' and rsi_1h > 60:
+                score += 10
+                reasons.append(f"💎 1H RSI overbought ({rsi_1h:.0f})")
 
-            # ── WARNINGS ──
-            if rsi > 70:
-                warnings.append("⚠️ RSI overbought on 15min")
-                score -= 12
-            if not in_discount:
-                warnings.append("⚠️ Price not in discount - risky entry")
-                score -= 10
-            if sweep.get('candles_ago', 999) > 40:
-                warnings.append("⚠️ Sweep is old (>10 hours)")
-                score -= 8
+            # [G] Zone position (0-10 pts)
+            if signal == 'LONG':
+                # Deeper in discount = better
+                dist_pct = (zones['equilibrium'] - current) / zones['equilibrium'] * 100
+                if dist_pct > 8:
+                    score += 10
+                    reasons.append(f"🔵 Deep in discount ({dist_pct:.1f}% below EQ)")
+                elif dist_pct > 3:
+                    score += 5
+            else:  # SHORT
+                dist_pct = (current - zones['equilibrium']) / zones['equilibrium'] * 100
+                if dist_pct > 8:
+                    score += 10
+                    reasons.append(f"🔴 Deep in premium ({dist_pct:.1f}% above EQ)")
+                elif dist_pct > 3:
+                    score += 5
 
             if score < self.min_score_threshold:
                 return None
 
             # ── TRADE LEVELS ──
             entry = current
+            eq    = zones['equilibrium']
 
-            # SL: Below sweep low
-            if sweep['swept']:
-                sl = sweep['sweep_low'] * 0.995
-            else:
-                sl = zones['swing_low'] * 0.98
+            if signal == 'LONG':
+                # SL below discount zone
+                sl = zones['swing_low'] * 0.985
+                # TPs: EQ → mid to high → high
+                tp1 = eq
+                tp2 = (eq + zones['swing_high']) / 2
+                tp3 = zones['swing_high'] * 0.99
+            else:  # SHORT
+                # SL above premium zone
+                sl = zones['swing_high'] * 1.015
+                # TPs: EQ → mid to low → low
+                tp1 = eq
+                tp2 = (eq + zones['swing_low']) / 2
+                tp3 = zones['swing_low'] * 1.01
 
-            risk_pct = (entry - sl) / entry * 100
-            if risk_pct > 8:
-                sl = entry * 0.95
-                risk_pct = 5.0
-
-            # TP: Equilibrium → Previous high → Premium
-            tp1 = zones['equilibrium']
-            tp2 = (zones['equilibrium'] + zones['swing_high']) / 2
-            tp3 = zones['swing_high'] * 0.99
+            risk_pct = abs(entry - sl) / entry * 100
+            if risk_pct > 10:
+                if signal == 'LONG':
+                    sl = entry * 0.94
+                else:
+                    sl = entry * 1.06
+                risk_pct = 6.0
 
             rr   = [abs(t - entry) / abs(sl - entry) for t in [tp1, tp2, tp3]]
             pcts = [(t - entry) / entry * 100          for t in [tp1, tp2, tp3]]
+            # Fix signs for SHORT
+            if signal == 'SHORT':
+                pcts = [-p for p in pcts]
 
             if   score >= 90: conf = 'ELITE 🔥🔥🔥'
             elif score >= 80: conf = 'HIGH 💎💎'
@@ -467,7 +583,7 @@ class SMC15MinScanner:
                 'success': True,
                 'symbol': symbol.replace('/USDT:USDT', ''),
                 'full_symbol': symbol,
-                'signal': 'LONG',
+                'signal': signal,
                 'confidence': conf,
                 'score': score,
                 'entry': entry,
@@ -479,11 +595,9 @@ class SMC15MinScanner:
                 'reasons': reasons,
                 'warnings': warnings,
                 'zones': zones,
-                'sweep': sweep,
-                'choch': choch,
-                'bos': bos,
-                'ob': ob,
+                'setup': setup,
                 'rsi': rsi,
+                'vol_ratio': volr,
                 'timestamp': datetime.now()
             }
 
@@ -498,50 +612,37 @@ class SMC15MinScanner:
     def format_alert(self, r, rank=None):
         rk = f"#{rank} " if rank else ""
         z  = r['zones']
+        s  = r['setup']
         
         msg  = f"{'═'*46}\n"
-        msg += f"💎 <b>{rk}15MIN SMC: {r['symbol']} — {r['confidence']}</b> 💎\n"
+        msg += f"💎 <b>{rk}EQ RETEST: {r['symbol']} — {r['confidence']}</b> 💎\n"
         msg += f"{'═'*46}\n\n"
 
-        msg += f"<b>LONG</b>  Score: {r['score']:.0f}/100\n"
+        msg += f"<b>{r['signal']}</b>  Score: {r['score']:.0f}/100\n"
         msg += f"RSI: {r['rsi']:.0f}\n\n"
 
         # Zones
-        msg += f"<b>🗺️ SMC ZONES (15m):</b>\n"
+        msg += f"<b>🗺️ ZONES (15m):</b>\n"
         msg += f"  🔴 Premium:  ${z['premium_start']:.6f}+\n"
         msg += f"  ⚖️ EQ:       ${z['equilibrium']:.6f}\n"
-        msg += f"  🔵 Discount: <${z['equilibrium']:.6f}\n"
+        msg += f"  🔵 Discount: <${z['discount_end']:.6f}\n"
         msg += f"  📍 Current:  ${r['entry']:.6f}\n\n"
 
-        # SMC confirmations
-        msg += f"<b>🎯 SMC SIGNALS:</b>\n"
-        if r['sweep']['swept']:
-            msg += f"  ✅ Liq. Sweep ({r['sweep']['candles_ago']}x15min ago)\n"
-        else:
-            msg += f"  ⏳ Liq. Sweep\n"
+        # Pattern details
+        msg += f"<b>🎯 PATTERN:</b>\n"
+        msg += f"  • Crossed to {'DISCOUNT' if r['signal']=='LONG' else 'PREMIUM'} {s['cross']['candles_ago']}x15min ago\n"
+        msg += f"  • <b>{s['retests']['retests']} EQ RETESTS</b> ✅\n"
+        msg += f"  • Holding in zone ✅\n\n"
 
-        if r['choch']['choch']:
-            msg += f"  ✅ CHoCH\n"
-        else:
-            msg += f"  ⏳ CHoCH\n"
-
-        if r['bos']['bos']:
-            msg += f"  ✅ BOS\n"
-        else:
-            msg += f"  ⏳ BOS\n"
-
-        if r['ob']['ob']:
-            msg += f"  ✅ Order Block\n"
-
-        msg += f"\n<b>💰 TRADE:</b>\n"
+        msg += f"<b>💰 TRADE:</b>\n"
         msg += f"  Entry: ${r['entry']:.6f}\n"
-        msg += f"  SL:    ${r['stop_loss']:.6f}  (-{r['risk_percent']:.1f}%)\n\n"
+        msg += f"  SL:    ${r['stop_loss']:.6f}  ({r['risk_percent']:.1f}%)\n\n"
 
         msg += f"<b>🎯 TARGETS:</b>\n"
-        labels = ['EQ', 'Mid', 'High']
+        labels = ['EQ', 'Mid', 'Extreme']
         for i, (tp, rr, pct, lbl) in enumerate(
                 zip(r['targets'], r['reward_ratios'], r['target_pcts'], labels), 1):
-            msg += f"  TP{i}: ${tp:.6f}  (+{pct:.1f}%  {rr:.1f}R)  [{lbl}]\n"
+            msg += f"  TP{i}: ${tp:.6f}  ({pct:+.1f}%  {rr:.1f}R)  [{lbl}]\n"
 
         msg += f"\n<b>✅ REASONS:</b>\n"
         for rs in r['reasons'][:6]:
@@ -553,7 +654,7 @@ class SMC15MinScanner:
                 msg += f"  {w}\n"
 
         msg += f"\n<i>⏰ {r['timestamp'].strftime('%H:%M')}</i>"
-        msg += f"\n<i>⚡ 15min SMC: Sweep → CHoCH → BOS → 🚀</i>"
+        msg += f"\n<i>💎 Cross → {s['retests']['retests']} Retests → Hold → 🚀</i>"
         msg += f"\n{'═'*46}"
         return msg
 
@@ -562,9 +663,9 @@ class SMC15MinScanner:
             return False
         if symbol in self.alerted_pairs:
             last = self.alerted_pairs[symbol]
-            # Only 2 hour cooldown for 15min (moves fast)
-            if datetime.now() - last['time'] < timedelta(hours=2):
-                if result['score'] < last['score'] + 20:
+            # 3 hour cooldown
+            if datetime.now() - last['time'] < timedelta(hours=3):
+                if result['score'] < last['score'] + 15:
                     return False
         return True
 
@@ -579,11 +680,11 @@ class SMC15MinScanner:
         if not self.pairs_to_scan:
             await self.load_all_usdt_pairs()
 
-        logger.info(f"💎 15MIN SMC SCAN: {len(self.pairs_to_scan)} pairs")
+        logger.info(f"💎 EQ RETEST SCAN: {len(self.pairs_to_scan)} pairs")
         await self.send_msg(
-            f"🔍 <b>15MIN SMC SCAN</b>\n\n"
+            f"🔍 <b>EQ RETEST SCAN</b>\n\n"
             f"Scanning {len(self.pairs_to_scan)} pairs\n"
-            f"Pattern: Sweep → CHoCH → BOS → Entry"
+            f"Pattern: Cross → Retests → Hold → 🚀"
         )
 
         t0 = datetime.now(); results = []; alerts = 0
@@ -598,17 +699,17 @@ class SMC15MinScanner:
                 data = await self.fetch_data(sym)
                 if not data:
                     continue
-                result = self.analyze_smc_15m(data, sym)
+                result = self.analyze_eq_retest(data, sym)
                 if result and result['success']:
                     results.append(result)
-                    logger.info(f"💎 {pair}  score={result['score']:.0f}")
+                    logger.info(f"💎 {pair} {result['signal']}  score={result['score']:.0f}")
                     if self.should_alert(result['full_symbol'], result) and alerts < self.max_alerts_per_scan:
                         alerts += 1
                         await self.send_msg(self.format_alert(result, rank=alerts))
                         tid = f"{result['symbol']}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
                         self.active_trades[tid] = {
                             'trade_id': tid, 'symbol': result['symbol'],
-                            'full_symbol': result['full_symbol'], 'signal': 'LONG',
+                            'full_symbol': result['full_symbol'], 'signal': result['signal'],
                             'entry': result['entry'], 'stop_loss': result['stop_loss'],
                             'targets': result['targets'], 'reward_ratios': result['reward_ratios'],
                             'timestamp': datetime.now(),
@@ -618,7 +719,7 @@ class SMC15MinScanner:
                             'time': datetime.now(), 'score': result['score']
                         }
                         self.stats['signals_found'] += 1
-                await asyncio.sleep(0.08)
+                await asyncio.sleep(0.07)
             except Exception as e:
                 logger.error(f"{pair}: {e}")
 
@@ -644,7 +745,7 @@ class SMC15MinScanner:
         return results
 
     async def auto_scan_loop(self):
-        logger.info(f"15min scan every {self.scan_interval//60}m")
+        logger.info(f"EQ scan every {self.scan_interval//60}m")
         while self.is_scanning:
             try:
                 await self.scan_all_pairs()
@@ -668,20 +769,29 @@ class SMC15MinScanner:
                             to_remove.append(tid); continue
                         ticker = await self.exchange.fetch_ticker(trade['full_symbol'])
                         price  = ticker['last']
+                        
+                        # Check TPs
                         for i, (tp, hit) in enumerate(zip(trade['targets'], trade['tp_hit'])):
-                            if not hit and price >= tp:
-                                pnl = (tp - trade['entry']) / trade['entry'] * 100
-                                msg = f"🎯 TP{i+1}!\n{trade['symbol']}\n+{pnl:.1f}% ({trade['reward_ratios'][i]:.1f}R)"
-                                await self.send_msg(msg)
-                                trade['tp_hit'][i] = True
-                                self.stats[f'tp{i+1}_hits'] += 1
-                                if i == 2: to_remove.append(tid)
-                        if not trade['sl_hit'] and price <= trade['stop_loss']:
-                            loss = (trade['stop_loss'] - trade['entry']) / trade['entry'] * 100
-                            await self.send_msg(f"🛑 SL\n{trade['symbol']}\n{loss:.1f}%")
-                            trade['sl_hit'] = True
-                            self.stats['sl_hits'] += 1
-                            to_remove.append(tid)
+                            if not hit:
+                                hit_condition = (price >= tp if trade['signal'] == 'LONG' else price <= tp)
+                                if hit_condition:
+                                    pnl = abs((price - trade['entry']) / trade['entry'] * 100)
+                                    msg = f"🎯 TP{i+1}!\n{trade['symbol']} {trade['signal']}\n+{pnl:.1f}% ({trade['reward_ratios'][i]:.1f}R)"
+                                    await self.send_msg(msg)
+                                    trade['tp_hit'][i] = True
+                                    self.stats[f'tp{i+1}_hits'] += 1
+                                    if i == 2: to_remove.append(tid)
+                        
+                        # Check SL
+                        if not trade['sl_hit']:
+                            sl_condition = (price <= trade['stop_loss'] if trade['signal'] == 'LONG' 
+                                          else price >= trade['stop_loss'])
+                            if sl_condition:
+                                loss = abs((trade['stop_loss'] - trade['entry']) / trade['entry'] * 100)
+                                await self.send_msg(f"🛑 SL\n{trade['symbol']} {trade['signal']}\n-{loss:.1f}%")
+                                trade['sl_hit'] = True
+                                self.stats['sl_hits'] += 1
+                                to_remove.append(tid)
                     except:
                         pass
                 for tid in to_remove:
@@ -700,11 +810,14 @@ class BotCmds:
         self.s = s
 
     async def cmd_start(self, u, c):
-        msg  = "⚡ <b>15MIN SMC SCANNER</b>\n\n"
-        msg += "<b>Timeframe: 15 MINUTE</b>\n"
-        msg += "<b>Scan: Every 10 min</b>\n\n"
-        msg += "Strategy:\n"
-        msg += "1️⃣ Liquidity sweep\n2️⃣ CHoCH\n3️⃣ BOS\n4️⃣ Discount entry\n5️⃣ 🚀\n\n"
+        msg  = "💎 <b>EQUILIBRIUM RETEST SCANNER</b>\n\n"
+        msg += "<b>The EXACT pattern from @free_fx_pro</b>\n\n"
+        msg += "Pattern:\n"
+        msg += "1️⃣ Cross into zone\n"
+        msg += "2️⃣ 2-3+ EQ retests\n"
+        msg += "3️⃣ Hold in zone\n"
+        msg += "4️⃣ 🚀 PUMP!\n\n"
+        msg += "15min charts • Scan every 5min\n\n"
         msg += "/start_scan\n/start_tracking\n/status\n/stats"
         await u.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
@@ -715,7 +828,7 @@ class BotCmds:
         self.s.is_scanning = True
         asyncio.create_task(self.s.auto_scan_loop())
         await u.message.reply_text(
-            f"✅ <b>15MIN SCANNER ON!</b>\n\nEvery {self.s.scan_interval//60}min\nScanning...",
+            f"✅ <b>EQ SCANNER ON!</b>\n\nEvery {self.s.scan_interval//60}min\nScanning...",
             parse_mode=ParseMode.HTML)
 
     async def cmd_stop_scan(self, u, c):
@@ -742,6 +855,9 @@ class BotCmds:
         scan = "🟢" if self.s.is_scanning else "🔴"
         trk  = "🟢" if self.s.is_tracking else "🔴"
         msg  = f"Scan: {scan}\nTrack: {trk}\nPairs: {len(self.s.pairs_to_scan)}\nActive: {len(self.s.active_trades)}"
+        if self.s.last_scan_time:
+            mins = int((datetime.now() - self.s.last_scan_time).total_seconds() // 60)
+            msg += f"\nLast: {mins}m ago"
         await u.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
     async def cmd_stats(self, u, c):
@@ -758,7 +874,7 @@ async def main():
     TOKEN = "8186622122:AAGtQcoh_s7QqIAVACmOYVHLqPX-p6dSNVA"
     CHAT  = "7500072234"
 
-    scanner = SMC15MinScanner(TOKEN, CHAT)
+    scanner = EquilibriumRetestScanner(TOKEN, CHAT)
     app     = Application.builder().token(TOKEN).build()
     cmds    = BotCmds(scanner)
 
@@ -772,13 +888,13 @@ async def main():
         app.add_handler(CommandHandler(cmd, fn))
 
     await app.initialize(); await app.start(); await app.updater.start_polling()
-    logger.info("⚡ 15MIN SMC SCANNER ONLINE!")
+    logger.info("💎 EQ RETEST SCANNER ONLINE!")
 
-    welcome  = "⚡ <b>15MIN SMC READY!</b>\n\n"
-    welcome += "<b>Timeframe: 15 MINUTE</b>\n"
-    welcome += "<b>Scan: Every 10 min</b>\n\n"
-    welcome += "✅ Liquidity sweeps\n✅ CHoCH detection\n✅ BOS confirmation\n"
-    welcome += "✅ Order blocks\n✅ Fast alerts\n\n"
+    welcome  = "💎 <b>EQ RETEST SCANNER READY!</b>\n\n"
+    welcome += "<b>Pattern from @free_fx_pro:</b>\n"
+    welcome += "Cross → 2-3 Retests → Hold → 🚀\n\n"
+    welcome += "✅ 15min charts\n✅ Scan every 5min\n"
+    welcome += "✅ Both LONG & SHORT\n✅ Fast alerts\n\n"
     welcome += "/start_scan\n/start_tracking"
     await scanner.send_msg(welcome)
 
