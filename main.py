@@ -14,393 +14,60 @@ from collections import deque
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Suppress pandas warnings
 import warnings
 warnings.filterwarnings('ignore')
 
-
-# ============================================================
-#  SMC + ORDER BLOCK ENGINE
-# ============================================================
-
-class SMCEngine:
-    """Smart Money Concepts: Order Blocks, FVG, BOS, MSS, Liquidity"""
-
-    # ── Structure ────────────────────────────────────────────
-
-    def find_swing_points(self, df, left=5, right=5):
-        """Detect swing highs and lows (pivot points)"""
-        highs, lows = [], []
-        for i in range(left, len(df) - right):
-            if all(df['high'].iloc[i] >= df['high'].iloc[i-left:i]) and \
-               all(df['high'].iloc[i] >= df['high'].iloc[i+1:i+right+1]):
-                highs.append({'index': i, 'price': df['high'].iloc[i]})
-            if all(df['low'].iloc[i] <= df['low'].iloc[i-left:i]) and \
-               all(df['low'].iloc[i] <= df['low'].iloc[i+1:i+right+1]):
-                lows.append({'index': i, 'price': df['low'].iloc[i]})
-        return highs, lows
-
-    def detect_bos_mss(self, df, highs, lows):
-        events = []
-        close = df['close']
-
-        for i in range(1, len(highs)):
-            prev_h = highs[i-1]['price']
-            curr_h = highs[i]['price']
-            idx = highs[i]['index']
-            if idx >= len(close): continue
-
-            for j in range(idx, min(idx+10, len(close))):
-                if close.iloc[j] > prev_h:
-                    ev_type = 'BOS_BULL' if curr_h > prev_h else 'MSS_BULL'
-                    events.append({'type': ev_type, 'index': j, 'level': prev_h})
-                    break
-
-        for i in range(1, len(lows)):
-            prev_l = lows[i-1]['price']
-            curr_l = lows[i]['price']
-            idx = lows[i]['index']
-            if idx >= len(close): continue
-
-            for j in range(idx, min(idx+10, len(close))):
-                if close.iloc[j] < prev_l:
-                    ev_type = 'BOS_BEAR' if curr_l < prev_l else 'MSS_BEAR'
-                    events.append({'type': ev_type, 'index': j, 'level': prev_l})
-                    break
-
-        if not events:
-            return None
-        return sorted(events, key=lambda x: x['index'])[-1]
-
-    def detect_order_blocks(self, df, highs, lows, lookback=30):
-        obs = []
-        n = len(df)
-        start = max(0, n - lookback)
-
-        for i in range(start + 2, n - 3):
-            candle = df.iloc[i]
-            is_bearish = candle['close'] < candle['open']
-            if not is_bearish:
-                continue
-            move = (df['high'].iloc[i+1:i+4].max() - candle['low']) / candle['low']
-            if move > 0.008:
-                ob = {
-                    'type': 'BULL',
-                    'index': i,
-                    'top': candle['open'],
-                    'bottom': candle['low'],
-                    'mid': (candle['open'] + candle['low']) / 2,
-                    'mitigated': False
-                }
-                future_lows = df['low'].iloc[i+1:n]
-                if (future_lows < ob['top']).any() and (future_lows > ob['bottom']).any():
-                    obs.append(ob)
-
-        for i in range(start + 2, n - 3):
-            candle = df.iloc[i]
-            is_bullish = candle['close'] > candle['open']
-            if not is_bullish:
-                continue
-            move = (candle['high'] - df['low'].iloc[i+1:i+4].min()) / candle['high']
-            if move > 0.008:
-                ob = {
-                    'type': 'BEAR',
-                    'index': i,
-                    'top': candle['high'],
-                    'bottom': candle['close'],
-                    'mid': (candle['high'] + candle['close']) / 2,
-                    'mitigated': False
-                }
-                future_highs = df['high'].iloc[i+1:n]
-                if (future_highs > ob['bottom']).any() and (future_highs < ob['top']).any():
-                    obs.append(ob)
-
-        return obs
-
-    def detect_fvg(self, df, lookback=20):
-        fvgs = []
-        n = len(df)
-        start = max(1, n - lookback - 1)
-
-        for i in range(start, n - 1):
-            prev = df.iloc[i-1]
-            curr = df.iloc[i]
-            nxt  = df.iloc[i+1]
-
-            if prev['high'] < nxt['low']:
-                size = nxt['low'] - prev['high']
-                fvgs.append({
-                    'type': 'BULL',
-                    'top': nxt['low'],
-                    'bottom': prev['high'],
-                    'mid': (nxt['low'] + prev['high']) / 2,
-                    'size_pct': size / curr['close'] * 100,
-                    'index': i
-                })
-
-            if prev['low'] > nxt['high']:
-                size = prev['low'] - nxt['high']
-                fvgs.append({
-                    'type': 'BEAR',
-                    'top': prev['low'],
-                    'bottom': nxt['high'],
-                    'mid': (prev['low'] + nxt['high']) / 2,
-                    'size_pct': size / curr['close'] * 100,
-                    'index': i
-                })
-
-        return fvgs
-
-    def detect_liquidity_sweeps(self, df, highs, lows, lookback=20):
-        sweeps = []
-        n = len(df)
-        recent_start = n - lookback
-
-        for sh in highs:
-            if sh['index'] < recent_start: continue
-            level = sh['price']
-            for j in range(sh['index']+1, min(sh['index']+8, n)):
-                c = df.iloc[j]
-                if c['high'] > level and c['close'] < level:
-                    sweeps.append({'type': 'BULL_SWEEP', 'level': level, 'index': j})
-                    break
-
-        for sl in lows:
-            if sl['index'] < recent_start: continue
-            level = sl['price']
-            for j in range(sl['index']+1, min(sl['index']+8, n)):
-                c = df.iloc[j]
-                if c['low'] < level and c['close'] > level:
-                    sweeps.append({'type': 'BEAR_SWEEP', 'level': level, 'index': j})
-                    break
-
-        return sweeps
-
-    def find_premium_discount(self, highs, lows, current_price):
-        if not highs or not lows:
-            return 'NEUTRAL', 0.5
-        recent_high = max(h['price'] for h in highs[-5:]) if len(highs) >= 5 else highs[-1]['price']
-        recent_low  = min(l['price'] for l in lows[-5:])  if len(lows)  >= 5 else lows[-1]['price']
-        rang = recent_high - recent_low
-        if rang == 0:
-            return 'NEUTRAL', 0.5
-        pos = (current_price - recent_low) / rang
-        if pos > 0.6:
-            return 'PREMIUM', pos
-        elif pos < 0.4:
-            return 'DISCOUNT', pos
-        return 'NEUTRAL', pos
-
-
-# ============================================================
-#  CONFIRMATION INDICATORS
-# ============================================================
-
-class ConfirmationEngine:
-    """High-conviction confirmation system layered on top of SMC"""
-
-    def confirm_entry(self, df_1h, df_15m, df_4h, signal_dir):
-        score = 0
-        reasons = []
-        latest = df_1h.iloc[-1]
-        prev   = df_1h.iloc[-2]
-        l15    = df_15m.iloc[-1]
-        l4h    = df_4h.iloc[-1]
-
-        # ── 1. TREND ALIGNMENT  (max 20 pts) ──────────────────
-        if 'ema_21' in latest.index and 'ema_50' in latest.index and 'ema_200' in latest.index:
-            if signal_dir == 'LONG':
-                if latest['ema_21'] > latest['ema_50'] > latest['ema_200']:
-                    score += 12
-                    reasons.append('✅ 4H Triple EMA Aligned Bull')
-                elif latest['ema_21'] > latest['ema_50']:
-                    score += 6
-                    reasons.append('✅ EMA 21>50 Bull')
-            else:
-                if latest['ema_21'] < latest['ema_50'] < latest['ema_200']:
-                    score += 12
-                    reasons.append('✅ 4H Triple EMA Aligned Bear')
-                elif latest['ema_21'] < latest['ema_50']:
-                    score += 6
-                    reasons.append('✅ EMA 21<50 Bear')
-
-        if 'ema_21' in l4h.index and 'ema_50' in l4h.index:
-            if signal_dir == 'LONG' and l4h['ema_21'] > l4h['ema_50']:
-                score += 8
-                reasons.append('✅ 4H Higher Timeframe Bull')
-            elif signal_dir == 'SHORT' and l4h['ema_21'] < l4h['ema_50']:
-                score += 8
-                reasons.append('✅ 4H Higher Timeframe Bear')
-
-        # ── 2. MOMENTUM CONFLUENCE  (max 25 pts) ──────────────
-        rsi = latest.get('rsi', 50)
-        rsi15 = l15.get('rsi', 50)
-
-        if signal_dir == 'LONG':
-            if 35 <= rsi <= 52:
-                score += 10
-                reasons.append(f'✅ RSI Reset Zone ({rsi:.0f})')
-            elif rsi < 35:
-                score += 7
-                reasons.append(f'✅ RSI Oversold ({rsi:.0f})')
-
-            if latest.get('macd', 0) > latest.get('macd_signal', 0) and \
-               prev.get('macd', 0) <= prev.get('macd_signal', 0):
-                score += 8
-                reasons.append('⚡ MACD Bullish Cross')
-            elif latest.get('macd', 0) > latest.get('macd_signal', 0):
-                score += 4
-                reasons.append('✅ MACD Bull')
-
-            if latest.get('stoch_rsi_k', 1) < 0.25 and \
-               latest.get('stoch_rsi_k', 0) > latest.get('stoch_rsi_d', 1):
-                score += 7
-                reasons.append('⚡ Stoch RSI Bullish Cross')
-        else:
-            if 48 <= rsi <= 65:
-                score += 10
-                reasons.append(f'✅ RSI Overbought Zone ({rsi:.0f})')
-            elif rsi > 65:
-                score += 7
-                reasons.append(f'✅ RSI Overbought ({rsi:.0f})')
-
-            if latest.get('macd', 0) < latest.get('macd_signal', 0) and \
-               prev.get('macd', 0) >= prev.get('macd_signal', 0):
-                score += 8
-                reasons.append('⚡ MACD Bearish Cross')
-            elif latest.get('macd', 0) < latest.get('macd_signal', 0):
-                score += 4
-                reasons.append('✅ MACD Bear')
-
-            if latest.get('stoch_rsi_k', 0) > 0.75 and \
-               latest.get('stoch_rsi_k', 1) < latest.get('stoch_rsi_d', 0):
-                score += 7
-                reasons.append('⚡ Stoch RSI Bearish Cross')
-
-        # ── 3. VOLUME CONFIRMATION  (max 20 pts) ──────────────
-        vol_ratio = latest.get('volume_ratio', 1.0)
-        if vol_ratio >= 2.5:
-            score += 10
-            reasons.append(f'🚀 Volume Spike {vol_ratio:.1f}x')
-        elif vol_ratio >= 1.5:
-            score += 5
-            reasons.append(f'✅ Above Avg Volume {vol_ratio:.1f}x')
-
-        cmf = latest.get('cmf', 0)
-        mfi = latest.get('mfi', 50)
-        if signal_dir == 'LONG':
-            if cmf > 0.1:
-                score += 5
-                reasons.append('✅ CMF Buying Pressure')
-            if mfi < 30:
-                score += 5
-                reasons.append(f'✅ MFI Oversold ({mfi:.0f})')
-        else:
-            if cmf < -0.1:
-                score += 5
-                reasons.append('✅ CMF Selling Pressure')
-            if mfi > 70:
-                score += 5
-                reasons.append(f'✅ MFI Overbought ({mfi:.0f})')
-
-        # ── 4. VOLATILITY STRUCTURE  (max 15 pts) ─────────────
-        bb_pband = latest.get('bb_pband', 0.5)
-        if signal_dir == 'LONG' and bb_pband < 0.15:
-            score += 8
-            reasons.append('💎 Price at Lower BB')
-        elif signal_dir == 'SHORT' and bb_pband > 0.85:
-            score += 8
-            reasons.append('💎 Price at Upper BB')
-
-        adx = latest.get('adx', 0)
-        di_plus = latest.get('di_plus', 0)
-        di_minus = latest.get('di_minus', 0)
-        if adx > 25:
-            if signal_dir == 'LONG' and di_plus > di_minus:
-                score += 7
-                reasons.append(f'✅ ADX Trend Strength ({adx:.0f})')
-            elif signal_dir == 'SHORT' and di_minus > di_plus:
-                score += 7
-                reasons.append(f'✅ ADX Trend Strength ({adx:.0f})')
-
-        # ── 5. 15M ENTRY TRIGGER  (max 20 pts) ────────────────
-        if 'bullish_engulfing' in l15.index and 'bearish_engulfing' in l15.index:
-            if signal_dir == 'LONG' and l15['bullish_engulfing'] == 1:
-                score += 12
-                reasons.append('🕯️ 15M Bullish Engulfing (Entry Trigger)')
-            elif signal_dir == 'SHORT' and l15['bearish_engulfing'] == 1:
-                score += 12
-                reasons.append('🕯️ 15M Bearish Engulfing (Entry Trigger)')
-
-        if 'bullish_pin_bar' in l15.index and signal_dir == 'LONG' and l15['bullish_pin_bar'] == 1:
-            score += 8
-            reasons.append('🕯️ 15M Bullish Pin Bar')
-        if 'bearish_pin_bar' in l15.index and signal_dir == 'SHORT' and l15['bearish_pin_bar'] == 1:
-            score += 8
-            reasons.append('🕯️ 15M Bearish Pin Bar')
-
-        return min(score, 100), reasons
-
-
-# ============================================================
-#  MAIN SCANNER BOT
-# ============================================================
-
-class SMCDayTradingScanner:
+class AdvancedDayTradingScanner:
     def __init__(self, telegram_token, telegram_chat_id, binance_api_key=None, binance_secret=None):
         self.telegram_token = telegram_token
         self.telegram_bot = Bot(token=telegram_token)
         self.chat_id = telegram_chat_id
-
         self.exchange = ccxt.binance({
             'apiKey': binance_api_key,
             'secret': binance_secret,
             'enableRateLimit': True,
             'options': {'defaultType': 'future'}
         })
-
-        self.smc = SMCEngine()
-        self.confirm = ConfirmationEngine()
-
         self.signal_history = deque(maxlen=200)
         self.active_trades = {}
         self.stats = {
             'total_signals': 0,
             'long_signals': 0,
             'short_signals': 0,
-            'elite_signals': 0,
             'premium_signals': 0,
             'tp1_hits': 0,
             'tp2_hits': 0,
             'tp3_hits': 0,
-            'sl_hits': 0,
             'last_scan_time': None,
             'pairs_scanned': 0
         }
         self.is_scanning = False
-
-    # ── Data Fetching ─────────────────────────────────────────
-
-    async def get_usdt_pairs(self):
-        """Top USDT perpetual futures by volume (min $5M/24h)"""
+        self.is_tracking = False
+        
+    async def get_all_usdt_pairs(self):
+        """Get ALL USDT perpetual pairs with quality volume filter"""
         try:
             await self.exchange.load_markets()
             tickers = await self.exchange.fetch_tickers()
+            
             pairs = []
             for symbol in self.exchange.symbols:
                 if symbol.endswith('/USDT:USDT') and 'PERP' not in symbol:
                     ticker = tickers.get(symbol)
-                    if ticker and ticker.get('quoteVolume', 0) > 5_000_000:
+                    if ticker and ticker.get('quoteVolume', 0) > 1000000:
                         pairs.append(symbol)
-            pairs = sorted(pairs, key=lambda x: tickers.get(x, {}).get('quoteVolume', 0), reverse=True)
-            logger.info(f"✅ {len(pairs)} high-quality pairs loaded")
-            return pairs
+            
+            sorted_pairs = sorted(pairs, key=lambda x: tickers.get(x, {}).get('quoteVolume', 0), reverse=True)
+            logger.info(f"✅ Found {len(sorted_pairs)} high-quality pairs")
+            return sorted_pairs
         except Exception as e:
-            logger.error(f"Pair fetch error: {e}")
+            logger.error(f"Error fetching pairs: {e}")
             return []
-
-    async def fetch_multi_tf(self, symbol):
-        """Fetch 4H, 1H, 15M data"""
-        timeframes = {'4h': 150, '1h': 150, '15m': 80}
+    
+    async def fetch_day_trading_data(self, symbol):
+        """Fetch multi-timeframe data"""
+        timeframes = {'1h': 100, '4h': 100, '15m': 50}
         data = {}
         try:
             for tf, limit in timeframes.items():
@@ -411,685 +78,824 @@ class SMCDayTradingScanner:
                 await asyncio.sleep(0.05)
             return data
         except Exception as e:
-            logger.error(f"Data fetch error {symbol}: {e}")
+            logger.error(f"Error fetching {symbol}: {e}")
             return None
-
-    # ── Indicators ────────────────────────────────────────────
-
-    def add_indicators(self, df):
-        """All required indicators for confirmation engine"""
+    
+    def calculate_supertrend(self, df, period=10, multiplier=3):
+        """Calculate SuperTrend"""
         try:
-            if len(df) < 50:
+            hl2 = (df['high'] + df['low']) / 2
+            atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=period).average_true_range()
+            
+            upper_band = hl2 + (multiplier * atr)
+            lower_band = hl2 - (multiplier * atr)
+            
+            supertrend = [0] * len(df)
+            for i in range(1, len(df)):
+                if df['close'].iloc[i] > upper_band.iloc[i-1]:
+                    supertrend[i] = lower_band.iloc[i]
+                elif df['close'].iloc[i] < lower_band.iloc[i-1]:
+                    supertrend[i] = upper_band.iloc[i]
+                else:
+                    supertrend[i] = supertrend[i-1]
+            
+            return pd.Series(supertrend, index=df.index)
+        except:
+            return pd.Series([0] * len(df), index=df.index)
+    
+    def calculate_advanced_indicators(self, df):
+        """Calculate 25+ advanced indicators"""
+        try:
+            if len(df) < 30:
                 return df
-
-            df['ema_9']   = ta.trend.EMAIndicator(df['close'], window=9).ema_indicator()
-            df['ema_21']  = ta.trend.EMAIndicator(df['close'], window=21).ema_indicator()
-            df['ema_50']  = ta.trend.EMAIndicator(df['close'], window=50).ema_indicator()
-            df['ema_200'] = ta.trend.EMAIndicator(df['close'], window=min(200, len(df)-1)).ema_indicator()
-
+            
+            # TREND
+            df['ema_9'] = ta.trend.EMAIndicator(df['close'], window=9).ema_indicator()
+            df['ema_21'] = ta.trend.EMAIndicator(df['close'], window=21).ema_indicator()
+            df['ema_50'] = ta.trend.EMAIndicator(df['close'], window=min(50, len(df)-1)).ema_indicator()
+            df['supertrend'] = self.calculate_supertrend(df)
+            
+            psar = ta.trend.PSARIndicator(df['high'], df['low'], df['close'])
+            df['psar'] = psar.psar()
+            
+            # MOMENTUM
             df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
-            macd = ta.trend.MACD(df['close'])
-            df['macd']        = macd.macd()
-            df['macd_signal'] = macd.macd_signal()
-            df['macd_hist']   = macd.macd_diff()
+            df['rsi_6'] = ta.momentum.RSIIndicator(df['close'], window=6).rsi()
+            
             stoch_rsi = ta.momentum.StochRSIIndicator(df['close'])
             df['stoch_rsi_k'] = stoch_rsi.stochrsi_k()
             df['stoch_rsi_d'] = stoch_rsi.stochrsi_d()
-
-            df['volume_sma']   = df['volume'].rolling(20).mean()
-            df['volume_ratio'] = df['volume'] / df['volume_sma'].replace(0, np.nan)
-            df['cmf']          = ta.volume.ChaikinMoneyFlowIndicator(df['high'], df['low'], df['close'], df['volume']).chaikin_money_flow()
-            df['mfi']          = ta.volume.MFIIndicator(df['high'], df['low'], df['close'], df['volume']).money_flow_index()
-            df['obv']          = ta.volume.OnBalanceVolumeIndicator(df['close'], df['volume']).on_balance_volume()
-
+            
+            macd = ta.trend.MACD(df['close'])
+            df['macd'] = macd.macd()
+            df['macd_signal'] = macd.macd_signal()
+            df['macd_hist'] = macd.macd_diff()
+            
+            stoch = ta.momentum.StochasticOscillator(df['high'], df['low'], df['close'])
+            df['stoch_k'] = stoch.stoch()
+            df['stoch_d'] = stoch.stoch_signal()
+            
+            df['williams_r'] = ta.momentum.WilliamsRIndicator(df['high'], df['low'], df['close']).williams_r()
+            df['roc'] = ta.momentum.ROCIndicator(df['close'], window=12).roc()
+            df['uo'] = ta.momentum.UltimateOscillator(df['high'], df['low'], df['close']).ultimate_oscillator()
+            
+            # VOLATILITY
             bb = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
-            df['bb_upper']  = bb.bollinger_hband()
-            df['bb_lower']  = bb.bollinger_lband()
+            df['bb_upper'] = bb.bollinger_hband()
             df['bb_middle'] = bb.bollinger_mavg()
-            df['bb_pband']  = bb.bollinger_pband()
-            df['atr']       = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close']).average_true_range()
-
-            adx_i = ta.trend.ADXIndicator(df['high'], df['low'], df['close'])
-            df['adx']      = adx_i.adx()
-            df['di_plus']  = adx_i.adx_pos()
-            df['di_minus'] = adx_i.adx_neg()
-
-            tp = (df['high'] + df['low'] + df['close']) / 3
-            df['vwap'] = (tp * df['volume']).cumsum() / df['volume'].cumsum()
-
-            body      = (df['close'] - df['open']).abs()
-            full_range = df['high'] - df['low']
-            upper_wick = df['high'] - df[['open', 'close']].max(axis=1)
-            lower_wick = df[['open', 'close']].min(axis=1) - df['low']
-
+            df['bb_lower'] = bb.bollinger_lband()
+            df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
+            df['bb_pband'] = bb.bollinger_pband()
+            
+            kc = ta.volatility.KeltnerChannel(df['high'], df['low'], df['close'])
+            df['kc_upper'] = kc.keltner_channel_hband()
+            df['kc_lower'] = kc.keltner_channel_lband()
+            
+            df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close']).average_true_range()
+            
+            dc = ta.volatility.DonchianChannel(df['high'], df['low'], df['close'])
+            df['dc_upper'] = dc.donchian_channel_hband()
+            df['dc_lower'] = dc.donchian_channel_lband()
+            
+            # VOLUME
+            df['volume_sma'] = df['volume'].rolling(window=20).mean()
+            df['volume_ratio'] = df['volume'] / df['volume_sma']
+            
+            df['obv'] = ta.volume.OnBalanceVolumeIndicator(df['close'], df['volume']).on_balance_volume()
+            df['obv_ema'] = df['obv'].ewm(span=20).mean()
+            
+            df['mfi'] = ta.volume.MFIIndicator(df['high'], df['low'], df['close'], df['volume']).money_flow_index()
+            df['ad'] = ta.volume.AccDistIndexIndicator(df['high'], df['low'], df['close'], df['volume']).acc_dist_index()
+            df['cmf'] = ta.volume.ChaikinMoneyFlowIndicator(df['high'], df['low'], df['close'], df['volume']).chaikin_money_flow()
+            
+            # TREND STRENGTH
+            adx = ta.trend.ADXIndicator(df['high'], df['low'], df['close'])
+            df['adx'] = adx.adx()
+            df['di_plus'] = adx.adx_pos()
+            df['di_minus'] = adx.adx_neg()
+            
+            df['cci'] = ta.trend.CCIIndicator(df['high'], df['low'], df['close']).cci()
+            
+            aroon = ta.trend.AroonIndicator(df['high'], df['low'])
+            df['aroon_up'] = aroon.aroon_up()
+            df['aroon_down'] = aroon.aroon_down()
+            df['aroon_ind'] = df['aroon_up'] - df['aroon_down']
+            
+            # VWAP (fixed calculation)
+            typical_price = (df['high'] + df['low'] + df['close']) / 3
+            df['vwap'] = (typical_price * df['volume']).cumsum() / df['volume'].cumsum()
+            df['vwap'] = df['vwap'].fillna(df['close'])  # Fill any NaN values
+            
+            # PATTERNS
+            df['bullish_candle'] = (df['close'] > df['open']).astype(int)
             df['bullish_engulfing'] = (
                 (df['close'].shift(1) < df['open'].shift(1)) &
                 (df['close'] > df['open']) &
-                (df['close'] > df['open'].shift(1)) &
-                (df['open'] < df['close'].shift(1))
+                (df['open'] <= df['close'].shift(1)) &
+                (df['close'] >= df['open'].shift(1))
             ).astype(int)
-
+            
             df['bearish_engulfing'] = (
                 (df['close'].shift(1) > df['open'].shift(1)) &
                 (df['close'] < df['open']) &
-                (df['close'] < df['open'].shift(1)) &
-                (df['open'] > df['close'].shift(1))
+                (df['open'] >= df['close'].shift(1)) &
+                (df['close'] <= df['open'].shift(1))
             ).astype(int)
-
-            df['bullish_pin_bar'] = (
-                (lower_wick > body * 2) &
-                (lower_wick > upper_wick * 2) &
-                (df['close'] > df['open'])
+            
+            # DIVERGENCE
+            df['bullish_divergence'] = (
+                (df['low'] < df['low'].shift(1)) &
+                (df['rsi'] > df['rsi'].shift(1))
             ).astype(int)
-
-            df['bearish_pin_bar'] = (
-                (upper_wick > body * 2) &
-                (upper_wick > lower_wick * 2) &
-                (df['close'] < df['open'])
+            
+            df['bearish_divergence'] = (
+                (df['high'] > df['high'].shift(1)) &
+                (df['rsi'] < df['rsi'].shift(1))
             ).astype(int)
-
+            
             return df
         except Exception as e:
             logger.error(f"Indicator error: {e}")
             return df
-
-    # ── SMC Signal Detection ──────────────────────────────────
-
-    def detect_smc_signal(self, data, symbol):
+    
+    def detect_volume_spike(self, df):
+        """Detect volume spikes"""
+        if len(df) < 20:
+            return False, 1.0
+        recent = df['volume'].iloc[-1]
+        avg = df['volume'].iloc[-20:].mean()
+        if avg == 0 or pd.isna(avg):  # Prevent division by zero
+            return False, 1.0
+        ratio = recent / avg
+        return recent > avg * 2.5, ratio
+    
+    def detect_signal(self, data, symbol):
+        """Advanced signal detection with 35-point scoring"""
         try:
+            if not data or '1h' not in data:
+                return None
+            
             for tf in data:
-                data[tf] = self.add_indicators(data[tf])
-
-            df_4h = data['4h']
+                data[tf] = self.calculate_advanced_indicators(data[tf])
+            
             df_1h = data['1h']
+            df_4h = data['4h']
             df_15m = data['15m']
-
-            if len(df_1h) < 80:
+            
+            if len(df_1h) < 50:
                 return None
-
-            latest_price = df_15m['close'].iloc[-1]
-            atr_1h = df_1h['atr'].iloc[-1]
-
-            highs_1h, lows_1h = self.smc.find_swing_points(df_1h, left=5, right=5)
-            structure = self.smc.detect_bos_mss(df_1h, highs_1h, lows_1h)
-
-            obs = self.smc.detect_order_blocks(df_1h, highs_1h, lows_1h, lookback=50)
-
-            fvgs_15m = self.smc.detect_fvg(df_15m, lookback=30)
-
-            sweeps = self.smc.detect_liquidity_sweeps(df_1h, highs_1h, lows_1h, lookback=30)
-
-            highs_4h, lows_4h = self.smc.find_swing_points(df_4h, left=5, right=5)
-            pd_zone, pd_pos = self.smc.find_premium_discount(highs_4h, lows_4h, latest_price)
-
-            if structure:
-                if structure['type'] in ('BOS_BULL', 'MSS_BULL'):
-                    bias = 'LONG'
-                elif structure['type'] in ('BOS_BEAR', 'MSS_BEAR'):
-                    bias = 'SHORT'
-                else:
-                    bias = None
-            else:
-                l4h = df_4h.iloc[-1]
-                if 'ema_21' in l4h and 'ema_50' in l4h:
-                    bias = 'LONG' if l4h['ema_21'] > l4h['ema_50'] else 'SHORT'
-                else:
+            
+            latest_1h = df_1h.iloc[-1]
+            prev_1h = df_1h.iloc[-2]
+            latest_4h = df_4h.iloc[-1]
+            latest_15m = df_15m.iloc[-1]
+            
+            # Check for required columns
+            required_cols = ['ema_9', 'ema_21', 'rsi', 'macd', 'vwap', 'bb_pband']
+            for col in required_cols:
+                if col not in latest_1h.index or pd.isna(latest_1h[col]):
+                    logger.error(f"Missing or NaN column: {col}")
                     return None
-
-            if not bias:
-                return None
-
-            if bias == 'LONG' and pd_zone == 'PREMIUM':
-                return None
-            if bias == 'SHORT' and pd_zone == 'DISCOUNT':
-                return None
-
-            relevant_ob = None
-            ob_proximity = atr_1h * 0.5
-
-            for ob in reversed(obs):
-                if ob['type'] == 'BULL' and bias == 'LONG':
-                    if ob['bottom'] <= latest_price <= ob['top'] + ob_proximity:
-                        relevant_ob = ob
-                        break
-                elif ob['type'] == 'BEAR' and bias == 'SHORT':
-                    if ob['bottom'] - ob_proximity <= latest_price <= ob['top']:
-                        relevant_ob = ob
-                        break
-
-            relevant_fvg = None
-            for fvg in reversed(fvgs_15m):
-                if fvg['type'] == 'BULL' and bias == 'LONG':
-                    if fvg['bottom'] <= latest_price <= fvg['top']:
-                        relevant_fvg = fvg
-                        break
-                elif fvg['type'] == 'BEAR' and bias == 'SHORT':
-                    if fvg['bottom'] <= latest_price <= fvg['top']:
-                        relevant_fvg = fvg
-                        break
-
-            recent_sweep = None
-            for sw in reversed(sweeps[-5:]):
-                if sw['type'] == 'BEAR_SWEEP' and bias == 'LONG':
-                    recent_sweep = sw
-                    break
-                elif sw['type'] == 'BULL_SWEEP' and bias == 'SHORT':
-                    recent_sweep = sw
-                    break
-
-            smc_reasons = []
-            smc_base_score = 0
-
-            if relevant_ob:
-                smc_reasons.append(f'📦 {bias} Order Block [{relevant_ob["bottom"]:.4f} - {relevant_ob["top"]:.4f}]')
-                smc_base_score += 30
-            if relevant_fvg:
-                smc_reasons.append(f'⚡ FVG Imbalance ({relevant_fvg["size_pct"]:.2f}%)')
-                smc_base_score += 15
-            if recent_sweep:
-                smc_reasons.append(f'💧 Liquidity Sweep @ {recent_sweep["level"]:.4f}')
-                smc_base_score += 20
-            if structure:
-                label = 'Break of Structure' if 'BOS' in structure['type'] else 'Market Structure Shift'
-                smc_reasons.append(f'🏗️ {label} ({structure["type"]})')
-                smc_base_score += 15
-            if pd_zone != 'NEUTRAL':
-                zone_label = '🟢 Discount Zone' if pd_zone == 'DISCOUNT' else '🔴 Premium Zone'
-                smc_reasons.append(f'{zone_label} ({pd_pos*100:.0f}%)')
-                smc_base_score += 10
-
-            if not relevant_ob and not (relevant_fvg and recent_sweep):
-                return None
-
-            conf_score, conf_reasons = self.confirm.confirm_entry(df_1h, df_15m, df_4h, bias)
-
-            total_score = min(smc_base_score + conf_score, 100)
-
-            # ── HARD GATE: Only ELITE signals (91+) pass through ──
-            ELITE_SCORE = 91
-            if total_score < ELITE_SCORE:
-                return None
-
-            quality = 'ELITE 👑'
-            self.stats['elite_signals'] += 1
-
-            entry = latest_price
-
-            if relevant_ob:
-                if bias == 'LONG':
-                    sl = relevant_ob['bottom'] - (atr_1h * 0.3)
-                    sl = min(sl, entry - atr_1h * 0.8)
+            
+            volume_spike, vol_ratio = self.detect_volume_spike(df_1h)
+            
+            long_score = 0
+            short_score = 0
+            max_score = 35
+            long_reasons = []
+            short_reasons = []
+            
+            # TREND (6 points)
+            if latest_4h['ema_9'] > latest_4h['ema_21'] > latest_4h['ema_50']:
+                long_score += 3
+                long_reasons.append('🔥 4H Uptrend')
+            elif latest_4h['ema_9'] < latest_4h['ema_21'] < latest_4h['ema_50']:
+                short_score += 3
+                short_reasons.append('🔥 4H Downtrend')
+            
+            if latest_1h['ema_9'] > latest_1h['ema_21']:
+                long_score += 2
+                long_reasons.append('1H Bullish')
+            elif latest_1h['ema_9'] < latest_1h['ema_21']:
+                short_score += 2
+                short_reasons.append('1H Bearish')
+            
+            if latest_1h['close'] > latest_1h['supertrend']:
+                long_score += 1
+                long_reasons.append('SuperTrend Bull')
+            elif latest_1h['close'] < latest_1h['supertrend']:
+                short_score += 1
+                short_reasons.append('SuperTrend Bear')
+            
+            # MOMENTUM (9 points)
+            if latest_1h['rsi'] < 30:
+                long_score += 3.5
+                long_reasons.append(f'💎 RSI Deep Oversold ({latest_1h["rsi"]:.0f})')
+            elif latest_1h['rsi'] < 40:
+                long_score += 2
+                long_reasons.append(f'RSI Oversold ({latest_1h["rsi"]:.0f})')
+            elif 40 <= latest_1h['rsi'] <= 50:
+                long_score += 1
+                long_reasons.append('RSI Buy Zone')
+            
+            if latest_1h['rsi'] > 70:
+                short_score += 3.5
+                short_reasons.append(f'💎 RSI Deep Overbought ({latest_1h["rsi"]:.0f})')
+            elif latest_1h['rsi'] > 60:
+                short_score += 2
+                short_reasons.append(f'RSI Overbought ({latest_1h["rsi"]:.0f})')
+            elif 50 <= latest_1h['rsi'] <= 60:
+                short_score += 1
+                short_reasons.append('RSI Sell Zone')
+            
+            if latest_1h['stoch_rsi_k'] < 0.2 and latest_1h['stoch_rsi_k'] > latest_1h['stoch_rsi_d']:
+                long_score += 2
+                long_reasons.append('⚡ Stoch RSI Cross')
+            elif latest_1h['stoch_rsi_k'] > 0.8 and latest_1h['stoch_rsi_k'] < latest_1h['stoch_rsi_d']:
+                short_score += 2
+                short_reasons.append('⚡ Stoch RSI Cross')
+            
+            if latest_1h['macd'] > latest_1h['macd_signal'] and prev_1h['macd'] <= prev_1h['macd_signal']:
+                long_score += 2.5
+                long_reasons.append('🎯 MACD Cross')
+            elif latest_1h['macd'] < latest_1h['macd_signal'] and prev_1h['macd'] >= prev_1h['macd_signal']:
+                short_score += 2.5
+                short_reasons.append('🎯 MACD Cross')
+            
+            if latest_1h['uo'] < 30:
+                long_score += 1.5
+                long_reasons.append('UO Oversold')
+            elif latest_1h['uo'] > 70:
+                short_score += 1.5
+                short_reasons.append('UO Overbought')
+            
+            # VOLUME (5 points)
+            if volume_spike:
+                if latest_1h['close'] > prev_1h['close']:
+                    long_score += 3
+                    long_reasons.append(f'🚀 VOL SPIKE ({vol_ratio:.1f}x)')
                 else:
-                    sl = relevant_ob['top'] + (atr_1h * 0.3)
-                    sl = max(sl, entry + atr_1h * 0.8)
+                    short_score += 3
+                    short_reasons.append(f'💥 VOL DUMP ({vol_ratio:.1f}x)')
+            
+            if latest_1h['mfi'] < 20:
+                long_score += 1.5
+                long_reasons.append(f'MFI Oversold ({latest_1h["mfi"]:.0f})')
+            elif latest_1h['mfi'] > 80:
+                short_score += 1.5
+                short_reasons.append(f'MFI Overbought ({latest_1h["mfi"]:.0f})')
+            
+            if latest_1h['cmf'] > 0.15:
+                long_score += 1
+                long_reasons.append('Strong Buying (CMF)')
+            elif latest_1h['cmf'] < -0.15:
+                short_score += 1
+                short_reasons.append('Strong Selling (CMF)')
+            
+            obv_trend = df_1h['obv'].iloc[-5:].diff().mean()
+            if obv_trend > 0 and latest_1h['obv'] > latest_1h['obv_ema']:
+                long_score += 0.5
+                long_reasons.append('OBV Accumulation')
+            elif obv_trend < 0 and latest_1h['obv'] < latest_1h['obv_ema']:
+                short_score += 0.5
+                short_reasons.append('OBV Distribution')
+            
+            # VOLATILITY (6 points)
+            if latest_1h['bb_pband'] < 0.1:
+                long_score += 2.5
+                long_reasons.append('💎 Lower BB')
+            elif latest_1h['bb_pband'] > 0.9:
+                short_score += 2.5
+                short_reasons.append('💎 Upper BB')
+            
+            if latest_1h['cci'] < -150:
+                long_score += 1.5
+                long_reasons.append('CCI Deep Oversold')
+            elif latest_1h['cci'] > 150:
+                short_score += 1.5
+                short_reasons.append('CCI Deep Overbought')
+            
+            if latest_1h['williams_r'] < -85:
+                long_score += 1
+                long_reasons.append('Williams Oversold')
+            elif latest_1h['williams_r'] > -15:
+                short_score += 1
+                short_reasons.append('Williams Overbought')
+            
+            if latest_1h['close'] < latest_1h['vwap'] * 0.98:
+                long_score += 1
+                long_reasons.append('Below VWAP')
+            elif latest_1h['close'] > latest_1h['vwap'] * 1.02:
+                short_score += 1
+                short_reasons.append('Above VWAP')
+            
+            # TREND STRENGTH (4 points)
+            if latest_1h['adx'] > 30:
+                if latest_1h['di_plus'] > latest_1h['di_minus']:
+                    long_score += 2
+                    long_reasons.append(f'🔥 Strong Up (ADX:{latest_1h["adx"]:.0f})')
+                else:
+                    short_score += 2
+                    short_reasons.append(f'🔥 Strong Down (ADX:{latest_1h["adx"]:.0f})')
+            elif latest_1h['adx'] > 25:
+                if latest_1h['di_plus'] > latest_1h['di_minus']:
+                    long_score += 1
+                else:
+                    short_score += 1
+            
+            if latest_1h['aroon_ind'] > 50:
+                long_score += 1
+                long_reasons.append('Aroon Up')
+            elif latest_1h['aroon_ind'] < -50:
+                short_score += 1
+                short_reasons.append('Aroon Down')
+            
+            if latest_1h['roc'] > 3:
+                long_score += 1
+                long_reasons.append('Strong Momentum')
+            elif latest_1h['roc'] < -3:
+                short_score += 1
+                short_reasons.append('Strong Momentum')
+            
+            # DIVERGENCE & PATTERNS (3 points)
+            if latest_1h['bullish_divergence'] == 1:
+                long_score += 2
+                long_reasons.append('🎯 Bullish Divergence')
+            elif latest_1h['bearish_divergence'] == 1:
+                short_score += 2
+                short_reasons.append('🎯 Bearish Divergence')
+            
+            if latest_15m['bullish_engulfing'] == 1:
+                long_score += 1.5
+                long_reasons.append('📊 Bullish Engulfing')
+            elif latest_15m['bearish_engulfing'] == 1:
+                short_score += 1.5
+                short_reasons.append('📊 Bearish Engulfing')
+            
+            # HTF CONFIRMATION (2 points)
+            if latest_4h['close'] > latest_4h['vwap']:
+                long_score += 1
             else:
-                sl = (entry - atr_1h * 1.2) if bias == 'LONG' else (entry + atr_1h * 1.2)
-
-            risk = abs(entry - sl)
-            if risk == 0:
-                return None
-
-            if bias == 'LONG':
-                targets = [
-                    entry + risk * 1.5,
-                    entry + risk * 2.5,
-                    entry + risk * 4.0,
-                ]
-            else:
-                targets = [
-                    entry - risk * 1.5,
-                    entry - risk * 2.5,
-                    entry - risk * 4.0,
-                ]
-
-            rr = [abs(tp - entry) / risk for tp in targets]
-            risk_pct = risk / entry * 100
-
-            trade_id = f"{symbol.split('/')[0]}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-
-            all_reasons = smc_reasons + conf_reasons
-
-            return {
-                'trade_id': trade_id,
-                'symbol': symbol.replace('/USDT:USDT', ''),
-                'full_symbol': symbol,
-                'signal': bias,
-                'quality': quality,
-                'score': total_score,
-                'smc_score': smc_base_score,
-                'conf_score': conf_score,
-                'entry': entry,
-                'stop_loss': sl,
-                'targets': targets,
-                'reward_ratios': rr,
-                'risk_percent': risk_pct,
-                'order_block': relevant_ob,
-                'fvg': relevant_fvg,
-                'sweep': recent_sweep,
-                'structure': structure,
-                'pd_zone': pd_zone,
-                'reasons': all_reasons[:14],
-                'tp_hit': [False, False, False],
-                'sl_hit': False,
-                'timestamp': datetime.now(),
-                'status': 'ACTIVE'
-            }
-
+                short_score += 1
+            
+            if latest_4h['rsi'] < 50:
+                long_score += 1
+            elif latest_4h['rsi'] > 50:
+                short_score += 1
+            
+            # DETERMINE SIGNAL
+            min_threshold = max_score * 0.51
+            signal = None
+            
+            if long_score > short_score and long_score >= min_threshold:
+                signal = 'LONG'
+                score = long_score
+                reasons = long_reasons
+                if long_score >= max_score * 0.71:
+                    quality = 'PREMIUM 💎'
+                elif long_score >= max_score * 0.60:
+                    quality = 'HIGH 🔥'
+                else:
+                    quality = 'GOOD ✅'
+            elif short_score > long_score and short_score >= min_threshold:
+                signal = 'SHORT'
+                score = short_score
+                reasons = short_reasons
+                if short_score >= max_score * 0.71:
+                    quality = 'PREMIUM 💎'
+                elif short_score >= max_score * 0.60:
+                    quality = 'HIGH 🔥'
+                else:
+                    quality = 'GOOD ✅'
+            
+            if signal:
+                entry = latest_15m['close']
+                atr = latest_1h['atr']
+                
+                if signal == 'LONG':
+                    sl = entry - (atr * 1.5)
+                    targets = [entry + (atr * 1), entry + (atr * 2), entry + (atr * 3.5)]
+                else:
+                    sl = entry + (atr * 1.5)
+                    targets = [entry - (atr * 1), entry - (atr * 2), entry - (atr * 3.5)]
+                
+                risk_pct = abs((sl - entry) / entry * 100)
+                rr = [(abs(tp - entry) / abs(sl - entry)) for tp in targets]
+                
+                trade_id = f"{symbol}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+                
+                return {
+                    'trade_id': trade_id,
+                    'symbol': symbol.replace('/USDT:USDT', ''),
+                    'full_symbol': symbol,
+                    'signal': signal,
+                    'quality': quality,
+                    'score': score,
+                    'max_score': max_score,
+                    'score_percent': (score / max_score) * 100,
+                    'entry': entry,
+                    'stop_loss': sl,
+                    'targets': targets,
+                    'reward_ratios': rr,
+                    'risk_percent': risk_pct,
+                    'reasons': reasons[:10],
+                    'tp_hit': [False, False, False],
+                    'sl_hit': False,
+                    'timestamp': datetime.now(),
+                    'status': 'ACTIVE'
+                }
+            
         except Exception as e:
-            logger.error(f"SMC detect error {symbol}: {e}")
+            logger.error(f"Signal detection error for {symbol}: {e}")
             return None
-
-    # ── Message Formatting ────────────────────────────────────
-
+        
+        return None
+    
     def format_signal(self, sig):
-        emoji = '🚀' if sig['signal'] == 'LONG' else '🔻'
-        dir_color = '🟢' if sig['signal'] == 'LONG' else '🔴'
-
-        score_bar_filled = int(sig['score'] / 10)
-        score_bar = '█' * score_bar_filled + '░' * (10 - score_bar_filled)
-
-        msg = f"{'━'*38}\n"
-        msg += f"{emoji} <b>SMC ORDER BLOCK — {sig['quality']}</b> {emoji}\n"
-        msg += f"{'━'*38}\n\n"
-
-        msg += f"<b>🆔</b> <code>{sig['trade_id']}</code>\n"
-        msg += f"<b>📊 PAIR:</b> <b>#{sig['symbol']}</b>\n"
-        msg += f"<b>📍 DIRECTION:</b> {dir_color} <b>{sig['signal']}</b>\n"
-        msg += f"<b>📍 ZONE:</b> {sig['pd_zone']}\n\n"
-
-        msg += f"<b>⭐ SCORE: {sig['score']:.0f}/100</b>\n"
-        msg += f"<code>[{score_bar}]</code>\n"
-        msg += f"  └ SMC: {sig['smc_score']:.0f}pt | Confirm: {sig['conf_score']:.0f}pt\n\n"
-
-        msg += f"<b>💰 ENTRY:</b> <code>${sig['entry']:.6f}</code>\n\n"
-
+        """Format signal message"""
+        emoji = "🚀" if sig['signal'] == 'LONG' else "🔻"
+        
+        msg = f"{'='*40}\n"
+        msg += f"{emoji} <b>24H DAY TRADE - {sig['quality']}</b> {emoji}\n"
+        msg += f"{'='*40}\n\n"
+        msg += f"<b>🆔:</b> <code>{sig['trade_id']}</code>\n"
+        msg += f"<b>📊 PAIR:</b> #{sig['symbol']}\n"
+        msg += f"<b>📍 DIR:</b> <b>{sig['signal']}</b>\n"
+        msg += f"<b>⭐ SCORE:</b> {sig['score']:.1f}/{sig['max_score']} ({sig['score_percent']:.0f}%)\n"
+        msg += f"{'▰' * int(sig['score_percent']/10)}{'▱' * (10-int(sig['score_percent']/10))}\n\n"
+        
+        msg += f"<b>💰 ENTRY:</b> ${sig['entry']:.6f}\n\n"
         msg += f"<b>🎯 TARGETS:</b>\n"
-        labels = [('TP1 — Partial (50%)', '4-8h'), ('TP2 — Partial (30%)', '12-18h'), ('TP3 — Final (20%)', '18-28h')]
-        for i, ((label, eta), tp, rr) in enumerate(zip(labels, sig['targets'], sig['reward_ratios']), 1):
+        times = ['2-4h', '8-12h', '16-24h']
+        for i, (tp, rr, t) in enumerate(zip(sig['targets'], sig['reward_ratios'], times), 1):
             pct = abs((tp - sig['entry']) / sig['entry'] * 100)
-            msg += f"  <b>{label}</b> [{eta}]\n"
-            msg += f"  <code>${tp:.6f}</code>  +{pct:.2f}%  RR {rr:.1f}:1\n\n"
-
-        sl_pct = sig['risk_percent']
-        msg += f"<b>🛑 STOP LOSS:</b> <code>${sig['stop_loss']:.6f}</code>  (-{sl_pct:.2f}%)\n"
-        if sig['order_block']:
-            ob = sig['order_block']
-            msg += f"  └ Below OB [{ob['bottom']:.5f} – {ob['top']:.5f}]\n"
-
-        msg += f"\n<b>📋 SMC CONFLUENCE:</b>\n"
+            msg += f"  TP{i} ({t}): ${tp:.6f} (+{pct:.2f}%) [RR {rr:.1f}:1]\n"
+        
+        msg += f"\n<b>🛑 SL:</b> ${sig['stop_loss']:.6f} (-{sig['risk_percent']:.2f}%)\n\n"
+        
+        msg += f"<b>✅ REASONS:</b>\n"
         for r in sig['reasons']:
             msg += f"  • {r}\n"
-
-        msg += f"\n<b>⚠️ RISK MGT:</b>\n"
-        msg += f"  • Risk max 1-2% of account\n"
-        msg += f"  • Move SL to breakeven after TP1\n"
-        msg += f"  • Close partial at each target\n"
-        msg += f"\n<b>📡 Live TP/SL Tracking Active</b>\n"
-        msg += f"<i>⏰ Signal: {sig['timestamp'].strftime('%Y-%m-%d %H:%M:%S')} UTC</i>\n"
-        msg += f"{'━'*38}"
-
+        
+        msg += f"\n<b>📡 LIVE TRACKING ACTIVE!</b>\n"
+        msg += f"<i>⏰ {sig['timestamp'].strftime('%H:%M:%S')}</i>\n"
+        msg += f"{'='*40}"
+        
         return msg
-
-    # ── Alerts ────────────────────────────────────────────────
-
-    async def send_msg(self, text):
+    
+    async def send_msg(self, msg):
+        """Send telegram message"""
         try:
-            await self.telegram_bot.send_message(
-                chat_id=self.chat_id, text=text, parse_mode=ParseMode.HTML
-            )
+            await self.telegram_bot.send_message(chat_id=self.chat_id, text=msg, parse_mode=ParseMode.HTML)
         except Exception as e:
-            logger.error(f"Telegram error: {e}")
-
+            logger.error(f"Send error: {e}")
+    
     async def send_tp_alert(self, trade, tp_num, price):
-        emoji = '🎉' if trade['signal'] == 'LONG' else '💰'
+        """TP hit alert"""
+        emoji = "🎉" if trade['signal'] == 'LONG' else "💰"
         tp = trade['targets'][tp_num - 1]
         pct = abs((tp - trade['entry']) / trade['entry'] * 100)
-
-        advice = {
-            1: '📋 Close 50% now\n📋 Move SL to Breakeven',
-            2: '📋 Close 30% more\n📋 Trail remaining stop',
-            3: '📋 Close final 20%\n🎊 Trade complete!'
-        }
-
-        msg = f"{emoji} <b>TP{tp_num} HIT!</b> {emoji}\n\n"
+        
+        msg = f"{emoji} <b>TARGET HIT!</b> {emoji}\n\n"
         msg += f"<code>{trade['trade_id']}</code>\n"
         msg += f"<b>{trade['symbol']}</b> {trade['signal']}\n\n"
-        msg += f"Target: <code>${tp:.6f}</code>\n"
-        msg += f"Current: <code>${price:.6f}</code>\n"
-        msg += f"Profit: <b>+{pct:.2f}%</b>\n\n"
-        msg += advice[tp_num]
-
+        msg += f"<b>✅ TP{tp_num} HIT!</b>\n"
+        msg += f"Target: ${tp:.6f}\n"
+        msg += f"Current: ${price:.6f}\n"
+        msg += f"Profit: +{pct:.2f}%\n\n"
+        
+        if tp_num == 1:
+            msg += f"📋 Take 50% profit NOW\nMove SL to breakeven"
+        elif tp_num == 2:
+            msg += f"📋 Take 30% profit NOW"
+        else:
+            msg += f"📋 Take remaining 20%\n🎊 TRADE COMPLETE!"
+        
         await self.send_msg(msg)
-
-        if tp_num == 1: self.stats['tp1_hits'] += 1
-        elif tp_num == 2: self.stats['tp2_hits'] += 1
-        else: self.stats['tp3_hits'] += 1
-
+        
+        if tp_num == 1:
+            self.stats['tp1_hits'] += 1
+        elif tp_num == 2:
+            self.stats['tp2_hits'] += 1
+        else:
+            self.stats['tp3_hits'] += 1
+    
     async def send_sl_alert(self, trade, price):
+        """SL hit alert"""
         loss = abs((price - trade['entry']) / trade['entry'] * 100)
-        msg = f"⛔ <b>STOP LOSS HIT</b> ⛔\n\n"
+        
+        msg = f"⚠️ <b>STOP LOSS HIT!</b> ⚠️\n\n"
         msg += f"<code>{trade['trade_id']}</code>\n"
-        msg += f"<b>{trade['symbol']}</b> {trade['signal']}\n\n"
-        msg += f"Entry: <code>${trade['entry']:.6f}</code>\n"
-        msg += f"SL: <code>${trade['stop_loss']:.6f}</code>\n"
-        msg += f"Current: <code>${price:.6f}</code>\n"
-        msg += f"Loss: <b>-{loss:.2f}%</b>\n\n"
-        msg += f"✅ OB invalidated — move on.\n"
-        msg += f"🔍 Next signal incoming!"
+        msg += f"{trade['symbol']} {trade['signal']}\n\n"
+        msg += f"Entry: ${trade['entry']:.6f}\n"
+        msg += f"SL: ${trade['stop_loss']:.6f}\n"
+        msg += f"Current: ${price:.6f}\n"
+        msg += f"Loss: -{loss:.2f}%"
+        
         await self.send_msg(msg)
-        self.stats['sl_hits'] += 1
-
-    # ── Trade Tracking ────────────────────────────────────────
-
+    
     async def track_trades(self):
-        logger.info("📡 Trade tracking started")
+        """Live trade tracking"""
+        self.is_tracking = True
+        logger.info("📡 Tracking started")
+        
         while True:
             try:
                 if not self.active_trades:
                     await asyncio.sleep(30)
                     continue
-
+                
                 to_remove = []
-
+                
                 for tid, trade in list(self.active_trades.items()):
                     try:
-                        if datetime.now() - trade['timestamp'] > timedelta(hours=28):
-                            await self.send_msg(
-                                f"⏰ <b>TIME LIMIT</b>\n<code>{tid}</code>\n"
-                                f"{trade['symbol']} — Please close manually."
-                            )
+                        # 24h timeout
+                        if datetime.now() - trade['timestamp'] > timedelta(hours=24):
+                            msg = f"⏰ 24H LIMIT\n<code>{tid}</code>\n{trade['symbol']}\nClose position!"
+                            await self.send_msg(msg)
                             to_remove.append(tid)
                             continue
-
+                        
                         ticker = await self.exchange.fetch_ticker(trade['full_symbol'])
                         price = ticker['last']
-
+                        
                         if trade['signal'] == 'LONG':
-                            for i, tp in enumerate(trade['targets']):
-                                if not trade['tp_hit'][i] and price >= tp:
-                                    await self.send_tp_alert(trade, i+1, price)
-                                    trade['tp_hit'][i] = True
-                                    if i == 2: to_remove.append(tid)
-
+                            if not trade['tp_hit'][0] and price >= trade['targets'][0]:
+                                await self.send_tp_alert(trade, 1, price)
+                                trade['tp_hit'][0] = True
+                            
+                            if not trade['tp_hit'][1] and price >= trade['targets'][1]:
+                                await self.send_tp_alert(trade, 2, price)
+                                trade['tp_hit'][1] = True
+                            
+                            if not trade['tp_hit'][2] and price >= trade['targets'][2]:
+                                await self.send_tp_alert(trade, 3, price)
+                                trade['tp_hit'][2] = True
+                                to_remove.append(tid)
+                            
                             if not trade['sl_hit'] and price <= trade['stop_loss']:
                                 await self.send_sl_alert(trade, price)
                                 trade['sl_hit'] = True
                                 to_remove.append(tid)
-                        else:
-                            for i, tp in enumerate(trade['targets']):
-                                if not trade['tp_hit'][i] and price <= tp:
-                                    await self.send_tp_alert(trade, i+1, price)
-                                    trade['tp_hit'][i] = True
-                                    if i == 2: to_remove.append(tid)
-
+                        
+                        else:  # SHORT
+                            if not trade['tp_hit'][0] and price <= trade['targets'][0]:
+                                await self.send_tp_alert(trade, 1, price)
+                                trade['tp_hit'][0] = True
+                            
+                            if not trade['tp_hit'][1] and price <= trade['targets'][1]:
+                                await self.send_tp_alert(trade, 2, price)
+                                trade['tp_hit'][1] = True
+                            
+                            if not trade['tp_hit'][2] and price <= trade['targets'][2]:
+                                await self.send_tp_alert(trade, 3, price)
+                                trade['tp_hit'][2] = True
+                                to_remove.append(tid)
+                            
                             if not trade['sl_hit'] and price >= trade['stop_loss']:
                                 await self.send_sl_alert(trade, price)
                                 trade['sl_hit'] = True
                                 to_remove.append(tid)
-
+                        
                     except Exception as e:
                         logger.error(f"Track error {tid}: {e}")
-
-                for tid in set(to_remove):
-                    self.active_trades.pop(tid, None)
-
+                        continue
+                
+                for tid in to_remove:
+                    del self.active_trades[tid]
+                    logger.info(f"✅ Trade done: {tid}")
+                
                 await asyncio.sleep(30)
-
+                
             except Exception as e:
-                logger.error(f"Tracking loop error: {e}")
+                logger.error(f"Tracking error: {e}")
                 await asyncio.sleep(60)
-
-    # ── Scanner ───────────────────────────────────────────────
-
+    
     async def scan_all(self):
+        """Scan all pairs"""
         if self.is_scanning:
-            logger.info("⚠️ Already scanning, skipping.")
+            logger.info("⚠️ Already scanning...")
             return []
-
+        
         self.is_scanning = True
-        logger.info("🔍 SMC Scan starting...")
-
-        await self.send_msg(
-            "🔍 <b>SMC ORDER BLOCK SCAN STARTED</b>\n"
-            "Hunting for ELITE setups only (91+/100)...\n"
-            "👑 Only the absolute best will make it through."
-        )
-
-        pairs = await self.get_usdt_pairs()
+        logger.info("🔍 Starting scan...")
+        
+        pairs = await self.get_all_usdt_pairs()
         signals = []
         scanned = 0
-
+        
         for pair in pairs:
             try:
-                logger.info(f"  📊 Scanning {pair}...")
-                data = await self.fetch_multi_tf(pair)
+                logger.info(f"📊 {pair}...")
+                data = await self.fetch_day_trading_data(pair)
+                
                 if data:
-                    sig = self.detect_smc_signal(data, pair)
+                    sig = self.detect_signal(data, pair)
                     if sig:
-                        # ✅ sig is GUARANTEED ELITE (88+) — detect_smc_signal now returns None for anything below
                         signals.append(sig)
                         self.signal_history.append(sig)
                         self.stats['total_signals'] += 1
-
+                        
                         if sig['signal'] == 'LONG':
                             self.stats['long_signals'] += 1
                         else:
                             self.stats['short_signals'] += 1
-
-                        # ✅ ELITE ONLY: add to tracking AND send to Telegram
+                        
+                        if sig['quality'] == 'PREMIUM 💎':
+                            self.stats['premium_signals'] += 1
+                        
                         self.active_trades[sig['trade_id']] = sig
-                        await self.send_msg(self.format_signal(sig))
-                        await asyncio.sleep(2)
-
+                        
+                        msg = self.format_signal(sig)
+                        await self.send_msg(msg)
+                        await asyncio.sleep(1.5)
+                
                 scanned += 1
-                if scanned % 30 == 0:
-                    logger.info(f"  ⏳ Progress: {scanned}/{len(pairs)}")
-
+                if scanned % 25 == 0:
+                    logger.info(f"📈 {scanned}/{len(pairs)}")
+                
                 await asyncio.sleep(0.5)
-
+                
             except Exception as e:
-                logger.error(f"Scan error {pair}: {e}")
+                logger.error(f"❌ {pair}: {e}")
                 continue
-
+        
         self.stats['last_scan_time'] = datetime.now()
         self.stats['pairs_scanned'] = scanned
-
-        longs  = sum(1 for s in signals if s['signal'] == 'LONG')
-        shorts = len(signals) - longs
-
-        summary  = f"✅ <b>SMC SCAN COMPLETE</b>\n\n"
-        summary += f"📊 Pairs scanned: {scanned}\n"
-        summary += f"👑 ELITE signals (91+): {len(signals)}\n"
+        
+        summary = f"✅ <b>SCAN COMPLETE</b>\n\n"
+        summary += f"📊 Scanned: {scanned}\n"
+        summary += f"🎯 Signals: {len(signals)}\n"
+        
         if signals:
+            longs = sum(1 for s in signals if s['signal'] == 'LONG')
+            shorts = len(signals) - longs
+            premium = sum(1 for s in signals if s['quality'] == 'PREMIUM 💎')
+            
             summary += f"  🟢 Long: {longs}\n"
             summary += f"  🔴 Short: {shorts}\n"
-        else:
-            summary += f"  🔕 No ELITE setups found this scan.\n"
+            summary += f"  💎 Premium: {premium}\n"
+        
         summary += f"  📡 Tracking: {len(self.active_trades)}\n"
-        summary += f"\n⏰ {datetime.now().strftime('%H:%M:%S')} UTC"
-
+        summary += f"\n⏰ {datetime.now().strftime('%H:%M:%S')}"
+        
         await self.send_msg(summary)
-        logger.info(f"✅ Scan done. {len(signals)} ELITE signals from {scanned} pairs.")
-
+        logger.info(f"🎉 Done! {len(signals)} signals")
+        
         self.is_scanning = False
         return signals
-
-    # ── Main Loop ─────────────────────────────────────────────
-
-    async def run(self, interval_min=60):
-        logger.info("🚀 SMC Order Block Scanner starting...")
-
-        welcome = (
-            "👑 <b>SMC ORDER BLOCK SCANNER — ELITE MODE</b> 👑\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>Strategy: Smart Money Concepts (SMC)</b>\n\n"
-            "✅ Order Block detection (OB)\n"
-            "✅ Fair Value Gap (FVG / Imbalance)\n"
-            "✅ Break of Structure (BOS)\n"
-            "✅ Market Structure Shift (MSS)\n"
-            "✅ Liquidity Sweep confirmation\n"
-            "✅ Premium / Discount zones\n"
-            "✅ 5-layer confirmation engine\n"
-            "✅ <b>ELITE ONLY: 91+/100 required</b>\n"
-            "✅ <b>ELITE ONLY tracking (no noise)</b>\n"
-            "✅ Live TP/SL tracking (28h)\n\n"
-            f"🕐 Auto-scan every {interval_min} min\n\n"
-            "<b>Commands:</b> /scan /stats /trades /help\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "👑 ELITE mode: only the highest-conviction setups."
-        )
+    
+    async def run(self, interval=60):
+        """Run continuously"""
+        logger.info("🚀 ADVANCED DAY TRADING SCANNER")
+        
+        welcome = "🔥 <b>ADVANCED 24H DAY TRADING SCANNER</b> 🔥\n\n"
+        welcome += "✅ ALL USDT pairs\n"
+        welcome += "✅ 25+ indicators\n"
+        welcome += "✅ Divergence detection\n"
+        welcome += "✅ Pattern recognition\n"
+        welcome += "✅ Live TP/SL tracking\n"
+        welcome += "✅ 35-point scoring\n\n"
+        welcome += f"Scans every {interval} min\n\n"
+        welcome += "<b>Commands:</b>\n"
+        welcome += "/scan /stats /trades /help\n\n"
+        welcome += "🎯 Advanced signals + Live alerts!"
+        
         await self.send_msg(welcome)
-
+        
         asyncio.create_task(self.track_trades())
-
+        
         while True:
             try:
                 await self.scan_all()
-                logger.info(f"💤 Next scan in {interval_min} min")
-                await asyncio.sleep(interval_min * 60)
+                logger.info(f"💤 Next scan in {interval} min")
+                await asyncio.sleep(interval * 60)
             except Exception as e:
-                logger.error(f"Main loop error: {e}")
+                logger.error(f"❌ {e}")
                 await asyncio.sleep(60)
-
+    
     async def close(self):
         await self.exchange.close()
 
-
-# ============================================================
-#  BOT COMMANDS
-# ============================================================
-
 class BotCommands:
-    def __init__(self, scanner: SMCDayTradingScanner):
+    def __init__(self, scanner):
         self.scanner = scanner
-
+    
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        msg = (
-            "👑 <b>SMC Order Block Trading Bot — ELITE MODE</b>\n\n"
-            "Professional Smart Money strategy.\n"
-            "You only receive <b>ELITE signals (91+/100)</b> — the best of the best.\n"
-            "Only ELITE signals are tracked. Zero noise.\n\n"
-            "<b>Commands:</b>\n"
-            "/scan — Force a full market scan\n"
-            "/stats — Performance statistics\n"
-            "/trades — Active tracked trades\n"
-            "/help — Detailed strategy explanation\n\n"
-            "👑 Only signals scoring 91+/100 are sent and tracked."
-        )
+        msg = "🚀 <b>Advanced Day Trading Scanner + Live Tracking!</b>\n\n"
+        msg += "Scans ALL USDT pairs with 25+ indicators.\n\n"
+        msg += "<b>Commands:</b>\n"
+        msg += "/scan - Force scan\n"
+        msg += "/stats - Statistics\n"
+        msg += "/trades - Active trades\n"
+        msg += "/help - Help\n\n"
+        msg += "💰 Get alerts when TPs hit!"
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
-
+    
     async def cmd_scan(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if self.scanner.is_scanning:
-            await update.message.reply_text("⚠️ Scan already running, please wait.")
+            await update.message.reply_text("⚠️ Scan running!")
             return
-        await update.message.reply_text("🔍 Manual scan started — ELITE signals only (91+/100)...")
-        asyncio.create_task(self.scanner.scan_all())
-
+        await update.message.reply_text("🔍 Starting scan...")
+        await self.scanner.scan_all()
+    
     async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         s = self.scanner.stats
-        msg  = f"📊 <b>SMC SCANNER STATISTICS</b>\n\n"
-        msg += f"👑 Elite signals found: {s['elite_signals']}\n"
-        msg += f"  🟢 Long: {s['long_signals']}\n"
-        msg += f"  🔴 Short: {s['short_signals']}\n\n"
-        msg += f"<b>TP/SL Performance:</b>\n"
-        msg += f"  TP1 Hits: {s['tp1_hits']}\n"
-        msg += f"  TP2 Hits: {s['tp2_hits']}\n"
-        msg += f"  TP3 Hits: {s['tp3_hits']}\n"
-        msg += f"  SL Hits: {s['sl_hits']}\n\n"
+        msg = f"📊 <b>STATISTICS</b>\n\n"
+        msg += f"Total: {s['total_signals']}\n"
+        msg += f"Long: {s['long_signals']} 🟢\n"
+        msg += f"Short: {s['short_signals']} 🔴\n"
+        msg += f"Premium: {s['premium_signals']} 💎\n\n"
+        msg += f"<b>TP Hits:</b>\n"
+        msg += f"  TP1: {s['tp1_hits']} 🎯\n"
+        msg += f"  TP2: {s['tp2_hits']} 🎯\n"
+        msg += f"  TP3: {s['tp3_hits']} 🎯\n\n"
         if s['last_scan_time']:
-            msg += f"Last scan: {s['last_scan_time'].strftime('%H:%M:%S')}\n"
-            msg += f"Pairs checked: {s['pairs_scanned']}\n"
-        msg += f"📡 Active trades: {len(self.scanner.active_trades)}"
+            msg += f"Last: {s['last_scan_time'].strftime('%H:%M:%S')}\n"
+            msg += f"Pairs: {s['pairs_scanned']}"
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
-
+    
     async def cmd_trades(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         trades = self.scanner.active_trades
+        
         if not trades:
-            await update.message.reply_text("📭 No active ELITE trades right now.")
+            await update.message.reply_text("📭 No active trades")
             return
-
-        msg = f"📡 <b>ACTIVE ELITE TRADES ({len(trades)})</b>\n\n"
-        for tid, t in list(trades.items())[:12]:
-            age_h = int((datetime.now() - t['timestamp']).total_seconds() / 3600)
-            tp_icons = ''.join(['✅' if h else '⏳' for h in t['tp_hit']])
-            sl_icon = '⛔' if t['sl_hit'] else '🟢'
-            msg += (
-                f"<b>{t['symbol']}</b> {t['signal']} — {t['quality']}\n"
-                f"  Score: {t['score']:.0f}/100 | {t['pd_zone']}\n"
-                f"  TPs: {tp_icons} SL: {sl_icon} | {age_h}h old\n\n"
-            )
+        
+        msg = f"📡 <b>ACTIVE TRADES ({len(trades)})</b>\n\n"
+        
+        for tid, t in list(trades.items())[:10]:
+            age = datetime.now() - t['timestamp']
+            hrs = int(age.total_seconds() / 3600)
+            
+            tp_status = ""
+            for i, hit in enumerate(t['tp_hit'], 1):
+                tp_status += "✅" if hit else "⏳"
+            
+            msg += f"<b>{t['symbol']}</b> {t['signal']}\n"
+            msg += f"  {tp_status} | {hrs}h old\n\n"
+        
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
-
+    
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        msg = (
-            "📚 <b>SMC ORDER BLOCK BOT — STRATEGY GUIDE</b>\n\n"
-            "<b>What is an Order Block?</b>\n"
-            "The last bearish candle before a bullish impulse (Bullish OB), "
-            "or the last bullish candle before a bearish impulse (Bearish OB). "
-            "Smart money leaves 'imprints' — price often returns to these zones.\n\n"
-            "<b>Entry Requirements (ALL must pass):</b>\n"
-            "1️⃣ Order Block detected on 1H\n"
-            "2️⃣ BOS/MSS confirms direction\n"
-            "3️⃣ Price in Discount (LONG) or Premium (SHORT)\n"
-            "4️⃣ FVG or Liquidity Sweep present\n"
-            "5️⃣ Confirmation indicators aligned\n"
-            "6️⃣ Score ≥ 91/100 (ELITE — hard gate)\n\n"
-            "<b>Risk Management:</b>\n"
-            "• SL placed below/above Order Block\n"
-            "• TP1 at 1:1.5 RR — close 50%\n"
-            "• TP2 at 1:2.5 RR — close 30%\n"
-            "• TP3 at 1:4 RR — close 20%\n"
-            "• Move SL to BE after TP1 hits\n\n"
-            "<b>Score Gate:</b>\n"
-            "👑 ELITE — 91+/100 ✅ Sent & Tracked\n"
-            "Everything below 91 → silently discarded\n\n"
-            "<b>Commands:</b> /scan /stats /trades /help"
-        )
+        msg = "📚 <b>ADVANCED DAY TRADING SCANNER</b>\n\n"
+        msg += "<b>Features:</b>\n"
+        msg += "• 25+ advanced indicators\n"
+        msg += "• Divergence detection\n"
+        msg += "• Pattern recognition\n"
+        msg += "• Volume analysis\n"
+        msg += "• Live TP/SL tracking\n"
+        msg += "• 35-point scoring\n\n"
+        msg += "<b>Indicators:</b>\n"
+        msg += "• Trend: EMA, SuperTrend, PSAR, Aroon\n"
+        msg += "• Momentum: RSI, MACD, Stoch RSI, UO\n"
+        msg += "• Volume: OBV, MFI, CMF, A/D\n"
+        msg += "• Volatility: BB, Keltner, Donchian\n"
+        msg += "• Patterns: Engulfing, Divergence\n\n"
+        msg += "<b>Quality:</b>\n"
+        msg += "💎 PREMIUM (71%+) - 25+ points\n"
+        msg += "🔥 HIGH (60%+) - 21+ points\n"
+        msg += "✅ GOOD (51%+) - 18+ points\n\n"
+        msg += "<b>Commands:</b>\n"
+        msg += "/scan /stats /trades /help"
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
-
-
-# ============================================================
-#  ENTRY POINT
-# ============================================================
 
 async def main():
-    # ======== CONFIG — Fill these in ========
-    TELEGRAM_TOKEN    = "7731521911:AAFnus-fDivEwoKqrtwZXMmKEj5BU1EhQn4"
-    TELEGRAM_CHAT_ID  = "7500072234"
-    BINANCE_API_KEY   = None   # Optional — public data only for scanning
-    BINANCE_SECRET    = None
-    SCAN_INTERVAL_MIN = 60     # How often to scan (minutes)
-    # =========================================
-
-    scanner = SMCDayTradingScanner(
+    # ========== CONFIG ==========
+    TELEGRAM_TOKEN = "7957028587:AAE7aSYtE4hCxxTIPkAs_1ULJ9e8alkY6Ic"
+    TELEGRAM_CHAT_ID = "7500072234"
+    BINANCE_API_KEY = None
+    BINANCE_SECRET = None
+    
+    scanner = AdvancedDayTradingScanner(
         telegram_token=TELEGRAM_TOKEN,
         telegram_chat_id=TELEGRAM_CHAT_ID,
         binance_api_key=BINANCE_API_KEY,
         binance_secret=BINANCE_SECRET
     )
-
+    
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    cmds = BotCommands(scanner)
-
-    app.add_handler(CommandHandler("start",  cmds.cmd_start))
-    app.add_handler(CommandHandler("scan",   cmds.cmd_scan))
-    app.add_handler(CommandHandler("stats",  cmds.cmd_stats))
-    app.add_handler(CommandHandler("trades", cmds.cmd_trades))
-    app.add_handler(CommandHandler("help",   cmds.cmd_help))
-
+    commands = BotCommands(scanner)
+    
+    app.add_handler(CommandHandler("start", commands.cmd_start))
+    app.add_handler(CommandHandler("scan", commands.cmd_scan))
+    app.add_handler(CommandHandler("stats", commands.cmd_stats))
+    app.add_handler(CommandHandler("trades", commands.cmd_trades))
+    app.add_handler(CommandHandler("help", commands.cmd_help))
+    
     await app.initialize()
     await app.start()
-    logger.info("🤖 Bot commands ready!")
-
+    
+    logger.info("🤖 Bot ready!")
+    
     try:
-        await scanner.run(interval_min=SCAN_INTERVAL_MIN)
+        await scanner.run(interval=15)
     except KeyboardInterrupt:
-        logger.info("⚠️ Shutdown requested...")
+        logger.info("⚠️ Shutting down...")
     finally:
         await scanner.close()
         await app.stop()
         await app.shutdown()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
