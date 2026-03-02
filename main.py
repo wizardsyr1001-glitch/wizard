@@ -1,24 +1,19 @@
 """
-SMC PRO SCANNER v4.1
+SMC PRO SCANNER v4.0
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CHANGES from v4.0:
-  - BTC Market Context Filter added (THE BIG UPGRADE)
-  - BTC fetched ONCE per scan — efficient, consistent
-  - Hard blocks: BTC dump > 2.5% 1H → no LONGs
-                 BTC pump > 2.5% 1H → no SHORTs
-                 BTC STRONG_BEAR + 3H -3% → LONG blocked
-                 BTC STRONG_BULL + 3H +3% → SHORT blocked
-  - Score modifiers: BTC aligned → +6 to +10 pts
-                     BTC opposing → -8 to -14 pts
-                     BTC at own OB (aligned) → +4 pts
-  - Scan summary now shows BTC trend + 1H/3H move
-  - Signal card shows BTC context section
-  - /btc command added — live BTC snapshot
+CHANGES from v3.2:
+  - Entry trigger moved 15M → 1H for higher accuracy signals
+  - 1H engulfing/pin/hammer now the primary trigger (was 15M)
+  - 15M kept only for volume spike confirmation bonus
+  - 1H trigger worth +25 pts (was +20) — reflects higher timeframe weight
+  - OB detection remains on 1H (unchanged)
+  - 4H HH/LL stays as +8 score bonus (not a hard gate)
+  - MIN_SCORE raised 72 → 75 (1H triggers are stronger, bar is higher)
+  - Scan stack: 4H trend → 1H structure + OB + trigger → 15M volume bonus
 
-TIMEFRAME ROLES v4.1:
-  BTC → Market king filter (hard gate + score modifier) ← NEW
+TIMEFRAME ROLES v4.0:
   4H  → Trend bias (EMA) + HH/LL structure depth
-  1H  → BOS/MSS + Order Block zone + Entry trigger candle
+  1H  → BOS/MSS + Order Block zone + Entry trigger candle  ← KEY CHANGE
   15M → Volume spike bonus only
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
@@ -45,23 +40,14 @@ warnings.filterwarnings('ignore')
 #  TUNABLE SETTINGS
 # ═══════════════════════════════════════════════
 MAX_SIGNALS_PER_SCAN  = 6
-MIN_SCORE             = 75
+MIN_SCORE             = 75       # raised from 72 — 1H triggers are stronger
 MIN_VOLUME_24H        = 5_000_000
 OB_TOLERANCE_PCT      = 0.008
 OB_IMPULSE_ATR_MULT   = 1.0
 STRUCTURE_LOOKBACK    = 20
-SCAN_INTERVAL_MIN     = 30
+SCAN_INTERVAL_MIN     = 60
 HH_LL_LOOKBACK        = 10
 HH_LL_BONUS           = 8
-
-# BTC filter thresholds
-BTC_HARD_BLOCK_1H_PCT  = 2.5   # % move in last 1H candle = hard block
-BTC_HARD_BLOCK_3H_PCT  = 3.0   # % move in last 3H combined = hard block (with strong trend)
-BTC_SCORE_STRONG       = 10    # pts bonus: BTC strongly aligned
-BTC_SCORE_ALIGNED      = 6     # pts bonus: BTC aligned
-BTC_SCORE_OPPOSE       = -8    # pts penalty: BTC opposing
-BTC_SCORE_STRONG_OPP   = -14   # pts penalty: BTC strongly opposing
-BTC_OB_BONUS           = 4     # pts: BTC sitting at its own OB (aligned direction)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -111,6 +97,7 @@ def add_indicators(df):
         uw   = df['high'] - df[['open','close']].max(axis=1)
         lw   = df[['open','close']].min(axis=1) - df['low']
 
+        # ── Trigger candles (now used on 1H) ──────────────────
         df['bull_engulf'] = (
             (df['close'].shift(1) < df['open'].shift(1)) &
             (df['close'] > df['open']) &
@@ -304,131 +291,18 @@ class SMCEngine:
 
 
 # ══════════════════════════════════════════════════════════════
-#  BTC MARKET CONTEXT ENGINE  ← NEW IN v4.1
-# ══════════════════════════════════════════════════════════════
-
-def check_btc_alignment(btc_ctx, direction):
-    """
-    Evaluate BTC context against the proposed trade direction.
-
-    Returns:
-        score_delta (int)   — points to add/subtract from signal score
-        hard_block  (bool)  — True = skip this signal entirely
-        label       (str)   — human-readable reason line
-    """
-    if btc_ctx is None:
-        return 0, False, "⚠️ BTC data unavailable — filter skipped"
-
-    trend  = btc_ctx['trend']
-    chg_1h = btc_ctx['1h_chg']
-    chg_3h = btc_ctx['3h_chg']
-    at_ob  = btc_ctx['at_ob']
-
-    # ────────────────────────────────────────────
-    #  HARD BLOCKS  (return immediately)
-    # ────────────────────────────────────────────
-
-    # BTC flash-dumped last 1H candle → no longs
-    if direction == 'LONG' and chg_1h < -BTC_HARD_BLOCK_1H_PCT:
-        return -999, True, (
-            f"🚫 BTC crashed {chg_1h:.1f}% last 1H — ALL LONGS BLOCKED"
-        )
-
-    # BTC flash-pumped last 1H candle → no shorts
-    if direction == 'SHORT' and chg_1h > BTC_HARD_BLOCK_1H_PCT:
-        return -999, True, (
-            f"🚫 BTC pumped +{chg_1h:.1f}% last 1H — ALL SHORTS BLOCKED"
-        )
-
-    # BTC in strong bear AND falling fast over 3H → no longs
-    if direction == 'LONG' and trend == 'STRONG_BEAR' and chg_3h < -BTC_HARD_BLOCK_3H_PCT:
-        return -999, True, (
-            f"🚫 BTC STRONG_BEAR + {chg_3h:.1f}% (3H) — LONG blocked"
-        )
-
-    # BTC in strong bull AND rising fast over 3H → no shorts
-    if direction == 'SHORT' and trend == 'STRONG_BULL' and chg_3h > BTC_HARD_BLOCK_3H_PCT:
-        return -999, True, (
-            f"🚫 BTC STRONG_BULL + +{chg_3h:.1f}% (3H) — SHORT blocked"
-        )
-
-    # ────────────────────────────────────────────
-    #  SCORE MODIFIERS
-    # ────────────────────────────────────────────
-    delta = 0
-    label = ""
-
-    if direction == 'LONG':
-        if trend == 'STRONG_BULL':
-            delta = BTC_SCORE_STRONG
-            label = f"🟠 BTC STRONG_BULL — LONG boosted (+{BTC_SCORE_STRONG}pts)"
-        elif trend == 'BULL':
-            delta = BTC_SCORE_ALIGNED
-            label = f"🟠 BTC BULL — LONG aligned (+{BTC_SCORE_ALIGNED}pts)"
-        elif trend == 'RANGING':
-            delta = 0
-            label = "🟠 BTC ranging — neutral for LONGs"
-        elif trend == 'BEAR':
-            delta = BTC_SCORE_OPPOSE
-            label = f"🟠 BTC BEAR — LONG penalty ({BTC_SCORE_OPPOSE}pts)"
-        elif trend == 'STRONG_BEAR':
-            delta = BTC_SCORE_STRONG_OPP
-            label = f"🟠 BTC STRONG_BEAR — LONG heavy penalty ({BTC_SCORE_STRONG_OPP}pts)"
-
-        # Extra: BTC sitting at its own bullish OB = king likely bouncing
-        if at_ob and trend in ('BULL', 'STRONG_BULL'):
-            delta += BTC_OB_BONUS
-            label += f" + BTC at OB support (+{BTC_OB_BONUS}pts)"
-
-    else:  # SHORT
-        if trend == 'STRONG_BEAR':
-            delta = BTC_SCORE_STRONG
-            label = f"🟠 BTC STRONG_BEAR — SHORT boosted (+{BTC_SCORE_STRONG}pts)"
-        elif trend == 'BEAR':
-            delta = BTC_SCORE_ALIGNED
-            label = f"🟠 BTC BEAR — SHORT aligned (+{BTC_SCORE_ALIGNED}pts)"
-        elif trend == 'RANGING':
-            delta = 0
-            label = "🟠 BTC ranging — neutral for SHORTs"
-        elif trend == 'BULL':
-            delta = BTC_SCORE_OPPOSE
-            label = f"🟠 BTC BULL — SHORT penalty ({BTC_SCORE_OPPOSE}pts)"
-        elif trend == 'STRONG_BULL':
-            delta = BTC_SCORE_STRONG_OPP
-            label = f"🟠 BTC STRONG_BULL — SHORT heavy penalty ({BTC_SCORE_STRONG_OPP}pts)"
-
-        # Extra: BTC sitting at its own bearish OB = king likely rejecting
-        if at_ob and trend in ('BEAR', 'STRONG_BEAR'):
-            delta += BTC_OB_BONUS
-            label += f" + BTC at OB resistance (+{BTC_OB_BONUS}pts)"
-
-    return delta, False, label
-
-
-def btc_trend_emoji(trend):
-    return {
-        'STRONG_BULL': '🟢🟢',
-        'BULL':        '🟢',
-        'RANGING':     '🟡',
-        'BEAR':        '🔴',
-        'STRONG_BEAR': '🔴🔴',
-    }.get(trend, '⚪')
-
-
-# ══════════════════════════════════════════════════════════════
-#  SCORER
+#  SCORER  (1H-based trigger, 15M volume bonus only)
 # ══════════════════════════════════════════════════════════════
 
 def score_setup(direction, ob, structure, sweep, fvg_near,
-                df_1h, df_15m, df_4h, pd_label, hh_ll_confirmed,
-                btc_delta=0, btc_label=""):
+                df_1h, df_15m, df_4h, pd_label, hh_ll_confirmed):
     score = 0
     reasons = []
     failed = []
 
-    l1  = df_1h.iloc[-1]
-    p1  = df_1h.iloc[-2]
-    l15 = df_15m.iloc[-1]
+    l1  = df_1h.iloc[-1]   # current 1H candle  ← ENTRY TRIGGER SOURCE
+    p1  = df_1h.iloc[-2]   # previous 1H candle
+    l15 = df_15m.iloc[-1]  # used for vol bonus only
     l4  = df_4h.iloc[-1]
 
     # ── 1. Structure (20 pts) ─────────────────────────────────
@@ -480,7 +354,8 @@ def score_setup(direction, ob, structure, sweep, fvg_near,
     else:
         failed.append(f"➖ 4H HH/LL not confirmed — ranging")
 
-    # ── 5. 1H Entry Trigger (25 pts) ─────────────────────────
+    # ── 5. 1H Entry Trigger (25 pts) ← UPGRADED FROM 15M ─────
+    # Now reading from 1H candles — much stronger signal weight
     trigger = False
     trigger_label = ""
 
@@ -526,7 +401,7 @@ def score_setup(direction, ob, structure, sweep, fvg_near,
     if trigger:
         reasons.append(trigger_label)
     else:
-        score -= 12
+        score -= 12  # harder penalty now — 1H trigger is the backbone
         failed.append("⏳ No 1H trigger candle yet — setup forming, wait for close")
 
     # ── 6. Momentum (12 pts) ─────────────────────────────────
@@ -558,19 +433,21 @@ def score_setup(direction, ob, structure, sweep, fvg_near,
         if sk1 > 0.7 and sk1 < sd1:
             score += 3; reasons.append("⚡ Stoch RSI bear cross")
 
-    # ── 7. Extras: Sweep / FVG / 15M Vol (10 pts) ────────────
+    # ── 7. Extras: Sweep / FVG / 15M Vol spike (10 pts) ──────
     extras = 0
     if sweep:
         extras += 4; reasons.append(f"💧 Liq. sweep @ {sweep['level']:.5f}")
     if fvg_near:
         extras += 3; reasons.append("⚡ FVG overlaps OB")
 
+    # 15M volume — only bonus use of 15M now
     vr15 = l15.get('vol_ratio', 1.0)
     if   vr15 >= 2.5:
         extras += 3; reasons.append(f"🚀 15M vol spike {vr15:.1f}x")
     elif vr15 >= 1.5:
         extras += 1; reasons.append(f"✅ 15M elevated vol {vr15:.1f}x")
 
+    # 1H VWAP confirmation
     close1 = l1.get('close', 0); vwap1 = l1.get('vwap', 0)
     if direction == 'LONG' and close1 < vwap1:
         extras = min(extras+1, 10); reasons.append("✅ 1H below VWAP")
@@ -578,11 +455,6 @@ def score_setup(direction, ob, structure, sweep, fvg_near,
         extras = min(extras+1, 10); reasons.append("✅ 1H above VWAP")
 
     score += min(extras, 10)
-
-    # ── 8. BTC Market Context (up to ±14 pts) ← NEW ──────────
-    if btc_label:
-        score += btc_delta
-        reasons.append(btc_label)
 
     return max(0, min(int(score), 100)), reasons, failed
 
@@ -606,96 +478,12 @@ class SMCProScanner:
         self.signal_history = deque(maxlen=300)
         self.is_scanning    = False
         self.last_debug     = []
-        self.last_btc_ctx   = None   # cached BTC context from last scan
         self.stats = {
             'total': 0, 'long': 0, 'short': 0,
             'elite': 0, 'premium': 0, 'high': 0,
             'tp1': 0, 'tp2': 0, 'tp3': 0, 'sl': 0,
-            'btc_blocks': 0,
             'last_scan': None, 'pairs_scanned': 0
         }
-
-    # ══════════════════════════════════════════
-    #  BTC CONTEXT FETCHER  ← NEW
-    # ══════════════════════════════════════════
-
-    async def fetch_btc_context(self):
-        """
-        Fetch BTC/USDT data and build a market context snapshot.
-        Called ONCE per scan, result reused for every alt pair.
-        """
-        try:
-            raw_4h = await self.exchange.fetch_ohlcv('BTC/USDT:USDT', '4h', limit=120)
-            raw_1h = await self.exchange.fetch_ohlcv('BTC/USDT:USDT', '1h', limit=80)
-
-            df4 = pd.DataFrame(raw_4h, columns=['ts','open','high','low','close','volume'])
-            df1 = pd.DataFrame(raw_1h, columns=['ts','open','high','low','close','volume'])
-            for df in [df4, df1]:
-                df['ts'] = pd.to_datetime(df['ts'], unit='ms')
-                add_indicators(df)
-
-            l4 = df4.iloc[-1]
-            l1 = df1.iloc[-1]
-
-            e21  = l4.get('ema_21', 0)
-            e50  = l4.get('ema_50', 0)
-            e200 = l4.get('ema_200', 0)
-
-            # Determine BTC 4H trend label
-            if e21 > e50 > e200:
-                btc_trend = 'STRONG_BULL'
-            elif e21 > e50:
-                btc_trend = 'BULL'
-            elif e21 < e50 < e200:
-                btc_trend = 'STRONG_BEAR'
-            elif e21 < e50:
-                btc_trend = 'BEAR'
-            else:
-                btc_trend = 'RANGING'
-
-            # 1H candle percentage change (most recent closed candle)
-            btc_1h_chg = (df1['close'].iloc[-1] - df1['open'].iloc[-1]) / df1['open'].iloc[-1] * 100
-
-            # 3H drift — last 3 candles combined
-            btc_3h_chg = (df1['close'].iloc[-1] - df1['open'].iloc[-3]) / df1['open'].iloc[-3] * 100
-
-            # Is BTC sitting at one of its own Order Blocks?
-            btc_price     = l1['close']
-            btc_obs_long  = self.smc.find_order_blocks(df1, 'LONG',  lookback=60)
-            btc_obs_short = self.smc.find_order_blocks(df1, 'SHORT', lookback=60)
-            btc_at_ob = (
-                any(self.smc.price_in_ob(btc_price, ob) for ob in btc_obs_long) or
-                any(self.smc.price_in_ob(btc_price, ob) for ob in btc_obs_short)
-            )
-
-            ctx = {
-                'trend':     btc_trend,
-                'price':     btc_price,
-                '1h_chg':    btc_1h_chg,
-                '3h_chg':    btc_3h_chg,
-                'at_ob':     btc_at_ob,
-                'rsi':       l1.get('rsi', 50),
-                'e21':       e21,
-                'e50':       e50,
-                'e200':      e200,
-                'macd_bull': l1.get('macd', 0) > l1.get('macd_signal', 0),
-            }
-
-            self.last_btc_ctx = ctx
-            logger.info(
-                f"🟠 BTC: {btc_trend} | Price: {btc_price:.0f} | "
-                f"1H: {btc_1h_chg:+.2f}% | 3H: {btc_3h_chg:+.2f}% | "
-                f"At OB: {btc_at_ob}"
-            )
-            return ctx
-
-        except Exception as e:
-            logger.error(f"BTC context error: {e}")
-            return None
-
-    # ══════════════════════════════════════════
-    #  DATA & PAIRS
-    # ══════════════════════════════════════════
 
     async def get_pairs(self):
         try:
@@ -717,6 +505,8 @@ class SMCProScanner:
         try:
             result = {}
             for tf, lim in [('4h', 220), ('1h', 150), ('15m', 80)]:
+                # 1H gets more candles now (it's doing more work)
+                # 15M only needs recent candles for vol check
                 raw = await self.exchange.fetch_ohlcv(symbol, tf, limit=lim)
                 df  = pd.DataFrame(raw, columns=['ts','open','high','low','close','volume'])
                 df['ts'] = pd.to_datetime(df['ts'], unit='ms')
@@ -726,11 +516,7 @@ class SMCProScanner:
         except Exception as e:
             logger.error(f"Fetch {symbol}: {e}"); return None
 
-    # ══════════════════════════════════════════
-    #  ANALYSIS (BTC context injected)
-    # ══════════════════════════════════════════
-
-    def analyse(self, data, symbol, btc_ctx=None):
+    def analyse(self, data, symbol):
         debug = {'symbol': symbol.replace('/USDT:USDT',''), 'gates': [], 'score': 0, 'bias': '?'}
 
         try:
@@ -739,7 +525,7 @@ class SMCProScanner:
                 debug['gates'].append('❌ Not enough candle data')
                 return None, debug
 
-            price = df1['close'].iloc[-1]
+            price = df1['close'].iloc[-1]   # price from 1H now (more stable)
 
             # Gate 1: 4H Bias
             l4 = df4.iloc[-1]
@@ -751,16 +537,7 @@ class SMCProScanner:
                 return None, debug
             debug['bias'] = bias
 
-            # ── BTC Hard Block check (early gate) ← NEW ────────
-            btc_delta, btc_block, btc_label = check_btc_alignment(btc_ctx, bias)
-            debug['gates'].append(f"🟠 BTC filter: {btc_label}")
-            if btc_block:
-                self.stats['btc_blocks'] += 1
-                debug['gates'].append(f'🚫 BTC hard block — {bias} skipped')
-                return None, debug
-            # ────────────────────────────────────────────────────
-
-            # HH/LL bonus check
+            # HH/LL bonus check (not a gate)
             hh_ll_ok, hh_ll_msg = self.smc.check_4h_hh_ll(df4, bias, HH_LL_LOOKBACK)
             debug['gates'].append(hh_ll_msg)
 
@@ -809,7 +586,7 @@ class SMCProScanner:
                 return None, debug
             debug['gates'].append(f'✅ Price IN OB [{active_ob["bottom"]:.5f}–{active_ob["top"]:.5f}]')
 
-            # FVG on 1H
+            # FVG on 1H (bonus)
             fvgs = self.smc.find_fvg(df1, bias, lookback=25)
             fvg_near = None
             for fvg in fvgs:
@@ -823,12 +600,10 @@ class SMCProScanner:
             if sweep:
                 debug['gates'].append(f'✅ 1H liq sweep @ {sweep["level"]:.5f}')
 
-            # Score (BTC delta passed in)
+            # Score
             score, reasons, failed = score_setup(
                 bias, active_ob, structure, sweep, fvg_near,
-                df1, df15, df4, pd_label, hh_ll_ok,
-                btc_delta=btc_delta,
-                btc_label=btc_label
+                df1, df15, df4, pd_label, hh_ll_ok
             )
             debug['score'] = score
             debug['gates'] += failed
@@ -885,8 +660,6 @@ class SMCProScanner:
                 'pd_zone':     pd_label,
                 'pd_pos':      pd_pos,
                 'reasons':     reasons,
-                'btc_ctx':     btc_ctx,      # store for card display
-                'btc_label':   btc_label,
                 'tp_hit':      [False, False, False],
                 'sl_hit':      False,
                 'timestamp':   datetime.now(),
@@ -899,10 +672,6 @@ class SMCProScanner:
             debug['gates'].append(f'💥 Exception: {e}')
             return None, debug
 
-    # ══════════════════════════════════════════
-    #  FORMAT SIGNAL CARD (BTC section added)
-    # ══════════════════════════════════════════
-
     def fmt(self, s):
         arrow    = '🟢' if s['signal'] == 'LONG' else '🔴'
         icon     = '🚀' if s['signal'] == 'LONG' else '🔻'
@@ -911,23 +680,8 @@ class SMCProScanner:
         ob       = s['ob']
         hh_tag   = '🏔️ Trending (HH/LL ✅)' if s.get('hh_ll') else '〰️ Ranging (no HH/LL)'
 
-        # BTC context lines
-        btc = s.get('btc_ctx')
-        if btc:
-            btc_emoji = btc_trend_emoji(btc['trend'])
-            btc_line  = (
-                f"{btc_emoji} BTC: <b>{btc['trend']}</b> "
-                f"| ${btc['price']:,.0f} "
-                f"| 1H: {btc['1h_chg']:+.2f}% "
-                f"| 3H: {btc['3h_chg']:+.2f}%"
-            )
-            btc_ob_line = "  └ BTC at own OB 🎯" if btc['at_ob'] else ""
-        else:
-            btc_line    = "⚪ BTC: data unavailable"
-            btc_ob_line = ""
-
         msg  = f"{'━'*40}\n"
-        msg += f"{icon} <b>SMC PRO v4.1 — {s['quality']}</b> {icon}\n"
+        msg += f"{icon} <b>SMC PRO v4 — {s['quality']}</b> {icon}\n"
         msg += f"{'━'*40}\n\n"
         msg += f"<b>🆔</b> <code>{s['trade_id']}</code>\n"
         msg += f"<b>📊 PAIR:</b>    <b>#{s['symbol']}USDT</b>\n"
@@ -935,17 +689,6 @@ class SMCProScanner:
         msg += f"<b>🗺️ ZONE:</b>    {z} ({s['pd_pos']*100:.0f}%)\n"
         msg += f"<b>📐 4H STR:</b>  {hh_tag}\n"
         msg += f"<b>⏱ ENTRY TF:</b> 1H candle trigger\n\n"
-
-        # ── BTC Market Context block ── NEW ──────────────
-        msg += f"<b>🟠 BTC CONTEXT:</b>\n"
-        msg += f"  {btc_line}\n"
-        if btc_ob_line:
-            msg += f"  {btc_ob_line}\n"
-        if s.get('btc_label'):
-            msg += f"  └ {s['btc_label']}\n"
-        msg += "\n"
-        # ─────────────────────────────────────────────────
-
         msg += f"<b>⭐ SCORE: {s['score']} / 100</b>\n"
         msg += f"<code>[{bar}]</code>\n\n"
         msg += f"<b>📦 ORDER BLOCK (1H):</b>\n"
@@ -968,7 +711,7 @@ class SMCProScanner:
             lbl = '🔄 MSS — Early Reversal' if 'MSS' in sk else '💥 BOS — Pullback Entry'
             msg += f"<b>🏗️ STRUCTURE:</b> {lbl}\n\n"
         msg += f"<b>📋 CONFLUENCE:</b>\n"
-        for r in s['reasons'][:13]:
+        for r in s['reasons'][:12]:
             msg += f"  • {r}\n"
         msg += f"\n<b>⚠️ RISK:</b> 1-2% per trade only\n"
         msg += f"  Move SL → BE after TP1 hits\n"
@@ -976,10 +719,6 @@ class SMCProScanner:
         msg += f"<i>🕐 {s['timestamp'].strftime('%Y-%m-%d %H:%M UTC')}</i>\n"
         msg += f"{'━'*40}"
         return msg
-
-    # ══════════════════════════════════════════
-    #  TELEGRAM HELPERS
-    # ══════════════════════════════════════════
 
     async def send(self, text):
         try:
@@ -1003,10 +742,6 @@ class SMCProScanner:
         msg += f"Entry: <code>${t['entry']:.6f}</code>\nLoss: <b>-{loss:.2f}%</b>\n\nOB invalidated. Next setup incoming."
         await self.send(msg)
         self.stats['sl'] += 1
-
-    # ══════════════════════════════════════════
-    #  TRADE TRACKER
-    # ══════════════════════════════════════════
 
     async def track(self):
         logger.info("📡 Tracker started")
@@ -1044,60 +779,34 @@ class SMCProScanner:
             except Exception as e:
                 logger.error(f"Track loop: {e}"); await asyncio.sleep(60)
 
-    # ══════════════════════════════════════════
-    #  MAIN SCAN
-    # ══════════════════════════════════════════
-
     async def scan(self):
         if self.is_scanning:
             return []
         self.is_scanning = True
         logger.info("🔍 Scan starting...")
 
-        # ── Step 1: Fetch BTC context ONCE ── NEW ──────────────
-        btc_ctx = await self.fetch_btc_context()
-
-        if btc_ctx:
-            btc_emoji = btc_trend_emoji(btc_ctx['trend'])
-            btc_status = (
-                f"{btc_emoji} BTC: <b>{btc_ctx['trend']}</b> | "
-                f"${btc_ctx['price']:,.0f} | "
-                f"1H: {btc_ctx['1h_chg']:+.2f}% | "
-                f"3H: {btc_ctx['3h_chg']:+.2f}%"
-                + (" | 🎯 At OB" if btc_ctx['at_ob'] else "")
-            )
-        else:
-            btc_status = "⚪ BTC: unavailable — filter skipped"
-        # ────────────────────────────────────────────────────────
-
         await self.send(
-            f"🔍 <b>SMC v4.1 SCAN STARTED</b>\n\n"
-            f"{btc_status}\n\n"
+            f"🔍 <b>SMC v4.0 SCAN STARTED</b>\n"
             f"Entry: <b>1H trigger</b> | Structure: 1H | Trend: 4H\n"
             f"Min score: {MIN_SCORE} | OB tol: {OB_TOLERANCE_PCT*100:.1f}%\n"
-            f"Vol filter: ${MIN_VOLUME_24H/1e6:.0f}M | HH/LL bonus: +{HH_LL_BONUS}pts\n"
-            f"BTC block thresholds: 1H±{BTC_HARD_BLOCK_1H_PCT}% | 3H±{BTC_HARD_BLOCK_3H_PCT}%"
+            f"Vol filter: ${MIN_VOLUME_24H/1e6:.0f}M | HH/LL bonus: +{HH_LL_BONUS}pts"
         )
 
         pairs       = await self.get_pairs()
         candidates  = []
         near_misses = []
-        btc_blocked = 0
         scanned     = 0
 
         for pair in pairs:
             try:
                 data = await self.fetch_data(pair)
                 if data:
-                    sig, dbg = self.analyse(data, pair, btc_ctx=btc_ctx)
+                    sig, dbg = self.analyse(data, pair)
                     if sig:
                         candidates.append(sig)
                         logger.info(f"  💎 {pair} {sig['signal']} score={sig['score']}")
                     else:
-                        # Count BTC blocks for summary
-                        if any('BTC hard block' in g or '🚫 BTC' in g for g in dbg['gates']):
-                            btc_blocked += 1
-                        elif dbg['score'] > 0 and any('✅ Price IN OB' in g for g in dbg['gates']):
+                        if dbg['score'] > 0 and any('✅ Price IN OB' in g for g in dbg['gates']):
                             near_misses.append(dbg)
                 scanned += 1
                 if scanned % 30 == 0:
@@ -1123,7 +832,7 @@ class SMCProScanner:
             await self.send(self.fmt(sig))
             await asyncio.sleep(2)
 
-        self.stats['last_scan']     = datetime.now()
+        self.stats['last_scan'] = datetime.now()
         self.stats['pairs_scanned'] = scanned
 
         el = sum(1 for s in top if 'ELITE'   in s['quality'])
@@ -1132,13 +841,10 @@ class SMCProScanner:
         lg = sum(1 for s in top if s['signal'] == 'LONG')
         tr = sum(1 for s in top if s.get('hh_ll'))
 
-        summ  = f"✅ <b>SCAN COMPLETE — v4.1</b>\n\n"
-        if btc_ctx:
-            summ += f"🟠 BTC: {btc_ctx['trend']} | {btc_ctx['1h_chg']:+.2f}% (1H) | {btc_ctx['3h_chg']:+.2f}% (3H)\n"
-        summ += f"📊 Pairs scanned:    {scanned}\n"
-        summ += f"🚫 BTC blocked:      {btc_blocked}\n"
-        summ += f"🔍 Candidates:       {len(candidates)}\n"
-        summ += f"🎯 Signals sent:     {len(top)}\n"
+        summ  = f"✅ <b>SCAN COMPLETE — v4.0</b>\n\n"
+        summ += f"📊 Pairs scanned: {scanned}\n"
+        summ += f"🔍 Candidates:    {len(candidates)}\n"
+        summ += f"🎯 Signals sent:  {len(top)}\n"
         if top:
             summ += f"  👑 Elite:    {el}\n  💎 Premium:  {pr}\n  🔥 High:     {hi}\n"
             summ += f"  🟢 Long:     {lg}\n  🔴 Short:    {len(top)-lg}\n"
@@ -1149,27 +855,24 @@ class SMCProScanner:
         summ += f"\n⏰ {datetime.now().strftime('%H:%M UTC')}"
         await self.send(summ)
 
-        logger.info(f"✅ Done. {len(candidates)} candidates → {len(top)} sent. BTC blocked: {btc_blocked}")
+        logger.info(f"✅ Done. {len(candidates)} candidates → {len(top)} sent.")
         self.is_scanning = False
         return top
 
     async def run(self, interval_min=SCAN_INTERVAL_MIN):
-        logger.info("🚀 SMC Pro v4.1 starting")
+        logger.info("🚀 SMC Pro v4.0 starting")
         await self.send(
-            "👑 <b>SMC PRO v4.1 — ORDER BLOCK SCANNER</b> 👑\n\n"
+            "👑 <b>SMC PRO v4.0 — ORDER BLOCK SCANNER</b> 👑\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>BTC King Filter  →  4H Trend  →  1H Structure + OB + Entry  →  15M Vol</b>\n\n"
-            f"✅ BTC market context: <b>ACTIVE</b> (hard gate + score mod)\n"
-            f"✅ Entry trigger: <b>1H candles</b>\n"
+            "<b>4H Trend  →  1H Structure + OB + Entry  →  15M Vol</b>\n\n"
+            f"✅ Entry trigger: <b>1H candles</b> (upgraded from 15M)\n"
             f"✅ Min score: {MIN_SCORE}/100\n"
             f"✅ OB tolerance: {OB_TOLERANCE_PCT*100:.1f}%\n"
             f"✅ Vol filter: ${MIN_VOLUME_24H/1e6:.0f}M/day\n"
             f"✅ 4H HH/LL bonus: +{HH_LL_BONUS}pts\n"
-            f"✅ BTC aligned bonus: +{BTC_SCORE_STRONG}pts (strong) / +{BTC_SCORE_ALIGNED}pts\n"
-            f"✅ BTC oppose penalty: {BTC_SCORE_STRONG_OPP}pts (strong) / {BTC_SCORE_OPPOSE}pts\n"
             f"✅ Trade timeout: 48H\n"
             f"✅ Scan every: {SCAN_INTERVAL_MIN} min\n\n"
-            "Commands: /scan /btc /stats /trades /debug /help\n"
+            "Commands: /scan /stats /trades /debug /help\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
         asyncio.create_task(self.track())
@@ -1195,10 +898,10 @@ class Commands:
 
     async def start(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(
-            "👑 <b>SMC Pro v4.1</b>\n\n"
-            "Now with BTC King Filter — signals only fire when BTC agrees.\n\n"
-            "Stack: BTC filter → 4H trend → 1H structure + OB + trigger → 15M vol\n\n"
-            "/scan /btc /stats /trades /debug /help",
+            "👑 <b>SMC Pro v4.0</b>\n\n"
+            "1H entry trigger — cleaner, stronger signals.\n\n"
+            "Stack: 4H trend → 1H structure + OB + trigger → 15M vol\n\n"
+            "/scan /stats /trades /debug /help",
             parse_mode=ParseMode.HTML
         )
 
@@ -1208,45 +911,12 @@ class Commands:
         await u.message.reply_text("🔍 Manual scan started...")
         asyncio.create_task(self.s.scan())
 
-    async def cmd_btc(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        """Show live BTC context snapshot. ← NEW COMMAND"""
-        await u.message.reply_text("🟠 Fetching BTC context...")
-        ctx = await self.s.fetch_btc_context()
-        if not ctx:
-            await u.message.reply_text("❌ Failed to fetch BTC data.")
-            return
-
-        em    = btc_trend_emoji(ctx['trend'])
-        ob_s  = "🎯 YES — BTC at its own Order Block" if ctx['at_ob'] else "➖ No"
-        macd  = "📈 Bullish" if ctx['macd_bull'] else "📉 Bearish"
-
-        msg  = f"🟠 <b>BTC MARKET CONTEXT</b>\n\n"
-        msg += f"Price:    <code>${ctx['price']:,.2f}</code>\n"
-        msg += f"Trend:    {em} <b>{ctx['trend']}</b>\n"
-        msg += f"RSI(1H):  {ctx['rsi']:.1f}\n"
-        msg += f"MACD:     {macd}\n\n"
-        msg += f"1H move:  <b>{ctx['1h_chg']:+.2f}%</b>\n"
-        msg += f"3H move:  <b>{ctx['3h_chg']:+.2f}%</b>\n\n"
-        msg += f"At OB:    {ob_s}\n\n"
-        msg += f"<b>Signal impact:</b>\n"
-        msg += f"  LONG  → {check_btc_alignment(ctx, 'LONG')[2]}\n"
-        msg += f"  SHORT → {check_btc_alignment(ctx, 'SHORT')[2]}\n\n"
-
-        # Block thresholds
-        if abs(ctx['1h_chg']) > BTC_HARD_BLOCK_1H_PCT:
-            direction = 'LONGs' if ctx['1h_chg'] < 0 else 'SHORTs'
-            msg += f"🚫 <b>HARD BLOCK ACTIVE</b> — {direction} blocked (1H move {ctx['1h_chg']:+.2f}%)\n\n"
-
-        msg += f"<i>🕐 {datetime.now().strftime('%H:%M UTC')}</i>"
-        await u.message.reply_text(msg, parse_mode=ParseMode.HTML)
-
     async def stats(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         s = self.s.stats
-        msg  = "📊 <b>SMC PRO v4.1 STATS</b>\n\n"
+        msg  = "📊 <b>SMC PRO v4.0 STATS</b>\n\n"
         msg += f"Total signals: {s['total']}\n"
         msg += f"  👑 Elite: {s['elite']}  💎 Premium: {s['premium']}  🔥 High: {s['high']}\n"
         msg += f"  🟢 Long: {s['long']}  🔴 Short: {s['short']}\n\n"
-        msg += f"🚫 BTC blocked (all-time): {s['btc_blocks']}\n\n"
         msg += f"TP1: {s['tp1']} | TP2: {s['tp2']} | TP3: {s['tp3']} | SL: {s['sl']}\n\n"
         if s['last_scan']:
             msg += f"Last scan: {s['last_scan'].strftime('%H:%M UTC')}\n"
@@ -1259,13 +929,12 @@ class Commands:
             await u.message.reply_text("📭 No active trades."); return
         msg = f"📡 <b>ACTIVE TRADES ({len(self.s.active_trades)})</b>\n\n"
         for tid, t in list(self.s.active_trades.items())[:10]:
-            age       = int((datetime.now() - t['timestamp']).total_seconds()/3600)
-            tps       = ''.join(['✅' if h else '⏳' for h in t['tp_hit']])
+            age      = int((datetime.now() - t['timestamp']).total_seconds()/3600)
+            tps      = ''.join(['✅' if h else '⏳' for h in t['tp_hit']])
             trend_tag = '🏔️' if t.get('hh_ll') else '〰️'
-            btc_t     = t.get('btc_ctx', {}).get('trend', '?') if t.get('btc_ctx') else '?'
             msg += (f"<b>{t['symbol']}</b> {t['signal']} {trend_tag} — {t['quality']}\n"
                     f"  Entry: <code>${t['entry']:.5f}</code> | Score: {t['score']}\n"
-                    f"  BTC was: {btc_t} | TPs: {tps} | {age}h old\n\n")
+                    f"  TPs: {tps} | {age}h old\n\n")
         await u.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
     async def debug(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -1276,52 +945,39 @@ class Commands:
         msg += "<i>(At OB but below score threshold)</i>\n\n"
         for d in self.s.last_debug[:8]:
             msg += f"<b>{d['symbol']}</b> {d['bias']} — Score: {d['score']}/100\n"
-            for g in d['gates'][-5:]:
+            for g in d['gates'][-4:]:
                 msg += f"  {g}\n"
             msg += "\n"
-        msg += f"<i>Min score: {MIN_SCORE}. 1H trigger = up to +25pts. BTC bonus = up to +{BTC_SCORE_STRONG + BTC_OB_BONUS}pts.</i>"
+        msg += f"<i>Min score: {MIN_SCORE}. 1H trigger = up to +25pts.</i>"
         await u.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
     async def help(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        msg  = "📚 <b>SMC PRO v4.1 — STRATEGY</b>\n\n"
+        msg  = "📚 <b>SMC PRO v4.0 — STRATEGY</b>\n\n"
         msg += "<b>Timeframe Stack:</b>\n"
-        msg += "  BTC → Market king filter (hard gate + score mod) ← NEW\n"
         msg += "  4H  → EMA bias + HH/LL depth\n"
-        msg += "  1H  → BOS/MSS + OB zone + Entry trigger\n"
+        msg += "  1H  → BOS/MSS + OB zone + Entry trigger  ← core\n"
         msg += "  15M → Volume spike bonus only\n\n"
         msg += "<b>Hard Gates (ALL must pass):</b>\n"
-        msg += "  0️⃣ BTC alignment check  ← NEW GATE\n"
         msg += "  1️⃣ 4H EMA 21/50 bias\n"
         msg += "  2️⃣ PD zone (no longs premium / no shorts discount)\n"
         msg += "  3️⃣ 1H BOS/MSS within 20 candles\n"
         msg += "  4️⃣ Price at valid 1H Order Block\n"
         msg += f"  5️⃣ Score ≥ {MIN_SCORE}/100\n\n"
-        msg += "<b>BTC Hard Blocks:</b>\n"
-        msg += f"  BTC dumps >{BTC_HARD_BLOCK_1H_PCT}% in 1H → all LONGs blocked\n"
-        msg += f"  BTC pumps >{BTC_HARD_BLOCK_1H_PCT}% in 1H → all SHORTs blocked\n"
-        msg += f"  BTC STRONG_BEAR + >{BTC_HARD_BLOCK_3H_PCT}% drop 3H → LONGs blocked\n"
-        msg += f"  BTC STRONG_BULL + >{BTC_HARD_BLOCK_3H_PCT}% pump 3H → SHORTs blocked\n\n"
         msg += "<b>Score System (max 100):</b>\n"
-        msg += "  +25 — 1H entry trigger (engulf/pin/hammer)\n"
+        msg += "  +25 — 1H entry trigger (engulf/pin/hammer) ⭐ main\n"
         msg += "  +20 — MSS structure\n"
         msg += "  +20 — Tight OB quality\n"
         msg += "  +15 — 4H triple EMA\n"
         msg += f"  +{HH_LL_BONUS}  — 4H HH/LL confirmed\n"
-        msg += f"  +{BTC_SCORE_STRONG} — BTC strongly aligned  ← NEW\n"
-        msg += f"  +{BTC_OB_BONUS}  — BTC at own OB (bonus)  ← NEW\n"
         msg += "  +12 — Momentum (RSI/MACD/Stoch)\n"
-        msg += "  +10 — Extras (sweep/FVG/vol)\n"
-        msg += f"  {BTC_SCORE_STRONG_OPP} — BTC strongly opposing  ← NEW\n\n"
-        msg += "<b>Commands:</b>\n"
-        msg += "  /btc    — Live BTC context snapshot\n"
-        msg += "  /scan   — Manual scan\n"
-        msg += "  /stats  — Bot stats\n"
-        msg += "  /trades — Active trades\n"
-        msg += "  /debug  — Near misses\n"
-        msg += f"\n<b>Config:</b>\n"
+        msg += "  +10 — Extras (sweep/FVG/vol)\n\n"
+        msg += "<b>TP timing adjusted for 1H entries:</b>\n"
+        msg += "  TP1 = 1:1.5 RR  [6-12h]\n"
+        msg += "  TP2 = 1:2.5 RR  [12-24h]\n"
+        msg += "  TP3 = 1:4.0 RR  [24-48h]\n\n"
+        msg += "<b>Config:</b>\n"
         msg += f"  MIN_SCORE={MIN_SCORE} | HH_LL_BONUS={HH_LL_BONUS}\n"
-        msg += f"  OB_TOLERANCE={OB_TOLERANCE_PCT} | SCAN={SCAN_INTERVAL_MIN}min\n"
-        msg += f"  BTC_BLOCK_1H={BTC_HARD_BLOCK_1H_PCT}% | BTC_BLOCK_3H={BTC_HARD_BLOCK_3H_PCT}%"
+        msg += f"  OB_TOLERANCE={OB_TOLERANCE_PCT} | LOOKBACK={HH_LL_LOOKBACK}"
         await u.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 
@@ -1349,7 +1005,6 @@ async def main():
 
     app.add_handler(CommandHandler("start",  cmds.start))
     app.add_handler(CommandHandler("scan",   cmds.cmd_scan))
-    app.add_handler(CommandHandler("btc",    cmds.cmd_btc))   # ← NEW
     app.add_handler(CommandHandler("stats",  cmds.stats))
     app.add_handler(CommandHandler("trades", cmds.trades))
     app.add_handler(CommandHandler("debug",  cmds.debug))
@@ -1357,7 +1012,7 @@ async def main():
 
     await app.initialize()
     await app.start()
-    logger.info("🤖 SMC Pro v4.1 ready!")
+    logger.info("🤖 SMC Pro v4.0 ready!")
 
     try:
         await scanner.run(interval_min=SCAN_INTERVAL_MIN)
