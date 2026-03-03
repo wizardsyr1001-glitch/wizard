@@ -1,20 +1,12 @@
 """
-SMC PRO SCANNER v4.0
+SMC PRO SCANNER v4.1
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CHANGES from v3.2:
-  - Entry trigger moved 15M → 1H for higher accuracy signals
-  - 1H engulfing/pin/hammer now the primary trigger (was 15M)
-  - 15M kept only for volume spike confirmation bonus
-  - 1H trigger worth +25 pts (was +20) — reflects higher timeframe weight
-  - OB detection remains on 1H (unchanged)
-  - 4H HH/LL stays as +8 score bonus (not a hard gate)
-  - MIN_SCORE raised 72 → 75 (1H triggers are stronger, bar is higher)
-  - Scan stack: 4H trend → 1H structure + OB + trigger → 15M volume bonus
-
-TIMEFRAME ROLES v4.0:
-  4H  → Trend bias (EMA) + HH/LL structure depth
-  1H  → BOS/MSS + Order Block zone + Entry trigger candle  ← KEY CHANGE
-  15M → Volume spike bonus only
+CHANGES from v4.0:
+  - LONG signals: DISCOUNT zone ONLY (price in lower 40% of 4H range)
+  - SHORT signals: PREMIUM zone ONLY (price in upper 40% of 4H range)
+  - NEUTRAL zone signals are fully blocked (not scored, not sent)
+  - Duplicate guard: same symbol+direction won't re-fire within 4H
+  - Signal card redesigned: clean, minimal, follower-friendly
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -37,10 +29,10 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ═══════════════════════════════════════════════
-#  TUNABLE SETTINGS
+#  SETTINGS
 # ═══════════════════════════════════════════════
 MAX_SIGNALS_PER_SCAN  = 6
-MIN_SCORE             = 75       # raised from 72 — 1H triggers are stronger
+MIN_SCORE             = 75
 MIN_VOLUME_24H        = 5_000_000
 OB_TOLERANCE_PCT      = 0.008
 OB_IMPULSE_ATR_MULT   = 1.0
@@ -48,6 +40,7 @@ STRUCTURE_LOOKBACK    = 20
 SCAN_INTERVAL_MIN     = 30
 HH_LL_LOOKBACK        = 10
 HH_LL_BONUS           = 8
+DUPLICATE_COOLDOWN_H  = 4   # hours before same symbol+direction can re-fire
 
 
 # ══════════════════════════════════════════════════════════════
@@ -74,11 +67,6 @@ def add_indicators(df):
 
         df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close']).average_true_range()
 
-        bb = ta.volatility.BollingerBands(df['close'], 20, 2)
-        df['bb_upper'] = bb.bollinger_hband()
-        df['bb_lower'] = bb.bollinger_lband()
-        df['bb_pband'] = bb.bollinger_pband()
-
         adx_i = ta.trend.ADXIndicator(df['high'], df['low'], df['close'])
         df['adx']    = adx_i.adx()
         df['di_pos'] = adx_i.adx_pos()
@@ -97,7 +85,6 @@ def add_indicators(df):
         uw   = df['high'] - df[['open','close']].max(axis=1)
         lw   = df[['open','close']].min(axis=1) - df['low']
 
-        # ── Trigger candles (now used on 1H) ──────────────────
         df['bull_engulf'] = (
             (df['close'].shift(1) < df['open'].shift(1)) &
             (df['close'] > df['open']) &
@@ -154,19 +141,19 @@ class SMCEngine:
     def check_4h_hh_ll(self, df_4h, direction, lookback=HH_LL_LOOKBACK):
         n = len(df_4h)
         if n < lookback * 2:
-            return False, "⚠️ Not enough 4H data for HH/LL check"
+            return False, "⚠️ Not enough 4H data"
         recent = df_4h.iloc[-lookback:]
         prior  = df_4h.iloc[-(lookback * 2):-lookback]
         if direction == 'LONG':
             rh, ph = recent['high'].max(), prior['high'].max()
             if rh > ph:
-                return True,  f"📈 4H Higher High ({ph:.5f} → {rh:.5f}) +{HH_LL_BONUS}pts"
-            return False, f"➖ 4H no HH ({rh:.5f} ≤ {ph:.5f}) — ranging"
+                return True, f"4H Higher High confirmed"
+            return False, f"4H no Higher High — ranging"
         else:
             rl, pl = recent['low'].min(), prior['low'].min()
             if rl < pl:
-                return True,  f"📉 4H Lower Low ({pl:.5f} → {rl:.5f}) +{HH_LL_BONUS}pts"
-            return False, f"➖ 4H no LL ({rl:.5f} ≥ {pl:.5f}) — ranging"
+                return True, f"4H Lower Low confirmed"
+            return False, f"4H no Lower Low — ranging"
 
     def detect_structure_break(self, df, highs, lows, lookback=STRUCTURE_LOOKBACK):
         events = []
@@ -291,7 +278,7 @@ class SMCEngine:
 
 
 # ══════════════════════════════════════════════════════════════
-#  SCORER  (1H-based trigger, 15M volume bonus only)
+#  SCORER
 # ══════════════════════════════════════════════════════════════
 
 def score_setup(direction, ob, structure, sweep, fvg_near,
@@ -300,111 +287,96 @@ def score_setup(direction, ob, structure, sweep, fvg_near,
     reasons = []
     failed = []
 
-    l1  = df_1h.iloc[-1]   # current 1H candle  ← ENTRY TRIGGER SOURCE
-    p1  = df_1h.iloc[-2]   # previous 1H candle
-    l15 = df_15m.iloc[-1]  # used for vol bonus only
+    l1  = df_1h.iloc[-1]
+    p1  = df_1h.iloc[-2]
+    l15 = df_15m.iloc[-1]
     l4  = df_4h.iloc[-1]
 
-    # ── 1. Structure (20 pts) ─────────────────────────────────
+    # 1. Structure (20 pts)
     if structure:
         if 'MSS' in structure['kind']:
-            score += 20; reasons.append(f"🏗️ MSS — Early Reversal ({structure['kind']})")
+            score += 20; reasons.append(f"MSS — Early Reversal")
         else:
-            score += 14; reasons.append(f"🏗️ BOS — Pullback Entry ({structure['kind']})")
+            score += 14; reasons.append(f"BOS — Pullback Entry")
     else:
-        failed.append("❌ No BOS/MSS in last 20 candles")
+        failed.append("No BOS/MSS in last 20 candles")
 
-    # ── 2. Order Block quality (20 pts) ──────────────────────
+    # 2. Order Block quality (20 pts)
     if ob:
         ob_size_pct = (ob['top'] - ob['bottom']) / ob['bottom'] * 100
         if ob_size_pct < 0.8:
-            score += 20; reasons.append(f"📦 Tight OB ({ob_size_pct:.2f}%) — high quality")
+            score += 20; reasons.append(f"Tight OB ({ob_size_pct:.2f}%) — high quality")
         elif ob_size_pct < 2.0:
-            score += 13; reasons.append(f"📦 OB ({ob_size_pct:.2f}%)")
+            score += 13; reasons.append(f"OB ({ob_size_pct:.2f}%)")
         else:
-            score += 7;  reasons.append(f"📦 Wide OB ({ob_size_pct:.2f}%) — lower quality")
+            score += 7;  reasons.append(f"Wide OB ({ob_size_pct:.2f}%) — lower quality")
     else:
-        failed.append("❌ No valid OB found")
+        failed.append("No valid OB found")
 
-    # ── 3. 4H Trend Alignment (15 pts) ───────────────────────
+    # 3. 4H Trend Alignment (15 pts)
     e21 = l4.get('ema_21', 0); e50 = l4.get('ema_50', 0); e200 = l4.get('ema_200', 0)
     if direction == 'LONG':
         if e21 > e50 > e200:
-            score += 15; reasons.append("📈 4H Triple EMA Bull Stack")
+            score += 15; reasons.append("4H Triple EMA Bull Stack")
         elif e21 > e50:
-            score += 10; reasons.append("📈 4H EMA 21>50 Bull")
+            score += 10; reasons.append("4H EMA 21>50 Bullish")
         elif pd_label == 'DISCOUNT':
-            score += 6;  reasons.append("📈 4H Discount Zone (counter-trend OK)")
+            score += 6;  reasons.append("4H Discount Zone")
         else:
-            failed.append("⚠️ 4H trend weak for LONG")
+            failed.append("4H trend weak for LONG")
     else:
         if e21 < e50 < e200:
-            score += 15; reasons.append("📉 4H Triple EMA Bear Stack")
+            score += 15; reasons.append("4H Triple EMA Bear Stack")
         elif e21 < e50:
-            score += 10; reasons.append("📉 4H EMA 21<50 Bear")
+            score += 10; reasons.append("4H EMA 21<50 Bearish")
         elif pd_label == 'PREMIUM':
-            score += 6;  reasons.append("📉 4H Premium Zone (counter-trend OK)")
+            score += 6;  reasons.append("4H Premium Zone")
         else:
-            failed.append("⚠️ 4H trend weak for SHORT")
+            failed.append("4H trend weak for SHORT")
 
-    # ── 4. 4H HH/LL Bonus (8 pts) ────────────────────────────
+    # 4. 4H HH/LL Bonus (8 pts)
     if hh_ll_confirmed:
         score += HH_LL_BONUS
-        reasons.append(f"🏔️ 4H HH/LL confirmed (+{HH_LL_BONUS}pts)")
-    else:
-        failed.append(f"➖ 4H HH/LL not confirmed — ranging")
+        reasons.append(f"4H HH/LL confirmed")
 
-    # ── 5. 1H Entry Trigger (25 pts) ← UPGRADED FROM 15M ─────
-    # Now reading from 1H candles — much stronger signal weight
+    # 5. 1H Entry Trigger (25 pts)
     trigger = False
     trigger_label = ""
 
     if direction == 'LONG':
         if l1.get('bull_engulf', 0) == 1:
-            score += 25; trigger = True
-            trigger_label = "🕯️ 1H Bullish Engulfing ✅ (strongest)"
+            score += 25; trigger = True; trigger_label = "1H Bullish Engulfing"
         elif l1.get('bull_pin', 0) == 1:
-            score += 22; trigger = True
-            trigger_label = "🕯️ 1H Bullish Pin Bar ✅"
+            score += 22; trigger = True; trigger_label = "1H Bullish Pin Bar"
         elif l1.get('hammer', 0) == 1:
-            score += 18; trigger = True
-            trigger_label = "🕯️ 1H Hammer ✅"
+            score += 18; trigger = True; trigger_label = "1H Hammer"
         elif p1.get('bull_engulf', 0) == 1:
-            score += 14; trigger = True
-            trigger_label = "🕯️ 1H Bull Engulf (prev candle) ✅"
+            score += 14; trigger = True; trigger_label = "1H Bull Engulf (prev)"
         elif p1.get('bull_pin', 0) == 1:
-            score += 11; trigger = True
-            trigger_label = "🕯️ 1H Bull Pin (prev candle) ✅"
+            score += 11; trigger = True; trigger_label = "1H Bull Pin (prev)"
         elif p1.get('hammer', 0) == 1:
-            score += 9;  trigger = True
-            trigger_label = "🕯️ 1H Hammer (prev candle) ✅"
+            score += 9;  trigger = True; trigger_label = "1H Hammer (prev)"
     else:
         if l1.get('bear_engulf', 0) == 1:
-            score += 25; trigger = True
-            trigger_label = "🕯️ 1H Bearish Engulfing ✅ (strongest)"
+            score += 25; trigger = True; trigger_label = "1H Bearish Engulfing"
         elif l1.get('bear_pin', 0) == 1:
-            score += 22; trigger = True
-            trigger_label = "🕯️ 1H Bearish Pin Bar ✅"
+            score += 22; trigger = True; trigger_label = "1H Bearish Pin Bar"
         elif l1.get('shooting_star', 0) == 1:
-            score += 18; trigger = True
-            trigger_label = "🕯️ 1H Shooting Star ✅"
+            score += 18; trigger = True; trigger_label = "1H Shooting Star"
         elif p1.get('bear_engulf', 0) == 1:
-            score += 14; trigger = True
-            trigger_label = "🕯️ 1H Bear Engulf (prev candle) ✅"
+            score += 14; trigger = True; trigger_label = "1H Bear Engulf (prev)"
         elif p1.get('bear_pin', 0) == 1:
-            score += 11; trigger = True
-            trigger_label = "🕯️ 1H Bear Pin (prev candle) ✅"
+            score += 11; trigger = True; trigger_label = "1H Bear Pin (prev)"
         elif p1.get('shooting_star', 0) == 1:
-            score += 9;  trigger = True
-            trigger_label = "🕯️ 1H Shooting Star (prev candle) ✅"
+            score += 9;  trigger = True; trigger_label = "1H Shooting Star (prev)"
 
     if trigger:
         reasons.append(trigger_label)
     else:
-        score -= 12  # harder penalty now — 1H trigger is the backbone
-        failed.append("⏳ No 1H trigger candle yet — setup forming, wait for close")
+        score -= 12
+        failed.append("No 1H trigger candle yet")
 
-    # ── 6. Momentum (12 pts) ─────────────────────────────────
+    # 6. Momentum (12 pts)
     rsi1  = l1.get('rsi', 50)
     macd1 = l1.get('macd', 0);  ms1  = l1.get('macd_signal', 0)
     pm1   = p1.get('macd', 0);  pms1 = p1.get('macd_signal', 0)
@@ -412,47 +384,45 @@ def score_setup(direction, ob, structure, sweep, fvg_near,
 
     if direction == 'LONG':
         if 28 <= rsi1 <= 55:
-            score += 4; reasons.append(f"✅ RSI reset zone ({rsi1:.0f})")
+            score += 4; reasons.append(f"RSI reset ({rsi1:.0f})")
         elif rsi1 < 28:
-            score += 3; reasons.append(f"✅ RSI oversold ({rsi1:.0f})")
+            score += 3; reasons.append(f"RSI oversold ({rsi1:.0f})")
         if macd1 > ms1 and pm1 <= pms1:
-            score += 5; reasons.append("⚡ MACD bull cross")
+            score += 5; reasons.append("MACD bull cross")
         elif macd1 > ms1:
-            score += 2; reasons.append("✅ MACD bullish")
+            score += 2; reasons.append("MACD bullish")
         if sk1 < 0.3 and sk1 > sd1:
-            score += 3; reasons.append("⚡ Stoch RSI bull cross")
+            score += 3; reasons.append("Stoch RSI bull cross")
     else:
         if 45 <= rsi1 <= 72:
-            score += 4; reasons.append(f"✅ RSI overbought zone ({rsi1:.0f})")
+            score += 4; reasons.append(f"RSI overbought zone ({rsi1:.0f})")
         elif rsi1 > 72:
-            score += 3; reasons.append(f"✅ RSI overbought ({rsi1:.0f})")
+            score += 3; reasons.append(f"RSI overbought ({rsi1:.0f})")
         if macd1 < ms1 and pm1 >= pms1:
-            score += 5; reasons.append("⚡ MACD bear cross")
+            score += 5; reasons.append("MACD bear cross")
         elif macd1 < ms1:
-            score += 2; reasons.append("✅ MACD bearish")
+            score += 2; reasons.append("MACD bearish")
         if sk1 > 0.7 and sk1 < sd1:
-            score += 3; reasons.append("⚡ Stoch RSI bear cross")
+            score += 3; reasons.append("Stoch RSI bear cross")
 
-    # ── 7. Extras: Sweep / FVG / 15M Vol spike (10 pts) ──────
+    # 7. Extras (10 pts)
     extras = 0
     if sweep:
-        extras += 4; reasons.append(f"💧 Liq. sweep @ {sweep['level']:.5f}")
+        extras += 4; reasons.append(f"Liquidity sweep @ {sweep['level']:.5f}")
     if fvg_near:
-        extras += 3; reasons.append("⚡ FVG overlaps OB")
+        extras += 3; reasons.append("FVG overlaps OB")
 
-    # 15M volume — only bonus use of 15M now
     vr15 = l15.get('vol_ratio', 1.0)
     if   vr15 >= 2.5:
-        extras += 3; reasons.append(f"🚀 15M vol spike {vr15:.1f}x")
+        extras += 3; reasons.append(f"15M vol spike {vr15:.1f}x")
     elif vr15 >= 1.5:
-        extras += 1; reasons.append(f"✅ 15M elevated vol {vr15:.1f}x")
+        extras += 1; reasons.append(f"15M elevated vol {vr15:.1f}x")
 
-    # 1H VWAP confirmation
     close1 = l1.get('close', 0); vwap1 = l1.get('vwap', 0)
     if direction == 'LONG' and close1 < vwap1:
-        extras = min(extras+1, 10); reasons.append("✅ 1H below VWAP")
+        extras = min(extras+1, 10); reasons.append("Below VWAP")
     elif direction == 'SHORT' and close1 > vwap1:
-        extras = min(extras+1, 10); reasons.append("✅ 1H above VWAP")
+        extras = min(extras+1, 10); reasons.append("Above VWAP")
 
     score += min(extras, 10)
 
@@ -478,12 +448,29 @@ class SMCProScanner:
         self.signal_history = deque(maxlen=300)
         self.is_scanning    = False
         self.last_debug     = []
+
+        # ── Duplicate guard: key = "SYMBOL_DIRECTION", value = last sent time
+        self.sent_signals: dict[str, datetime] = {}
+
         self.stats = {
             'total': 0, 'long': 0, 'short': 0,
             'elite': 0, 'premium': 0, 'high': 0,
             'tp1': 0, 'tp2': 0, 'tp3': 0, 'sl': 0,
+            'skipped_zone': 0, 'skipped_dup': 0,
             'last_scan': None, 'pairs_scanned': 0
         }
+
+    def is_duplicate(self, symbol: str, direction: str) -> bool:
+        """Returns True if we already sent this symbol+direction within cooldown window."""
+        key = f"{symbol}_{direction}"
+        last = self.sent_signals.get(key)
+        if last and datetime.now() - last < timedelta(hours=DUPLICATE_COOLDOWN_H):
+            return True
+        return False
+
+    def mark_sent(self, symbol: str, direction: str):
+        key = f"{symbol}_{direction}"
+        self.sent_signals[key] = datetime.now()
 
     async def get_pairs(self):
         try:
@@ -496,7 +483,6 @@ class SMCProScanner:
                 and tickers.get(s, {}).get('quoteVolume', 0) > MIN_VOLUME_24H
             ]
             pairs.sort(key=lambda x: tickers.get(x, {}).get('quoteVolume', 0), reverse=True)
-            logger.info(f"✅ {len(pairs)} pairs (vol>${MIN_VOLUME_24H/1e6:.0f}M)")
             return pairs
         except Exception as e:
             logger.error(f"Pairs: {e}"); return []
@@ -505,8 +491,6 @@ class SMCProScanner:
         try:
             result = {}
             for tf, lim in [('4h', 220), ('1h', 150), ('15m', 80)]:
-                # 1H gets more candles now (it's doing more work)
-                # 15M only needs recent candles for vol check
                 raw = await self.exchange.fetch_ohlcv(symbol, tf, limit=lim)
                 df  = pd.DataFrame(raw, columns=['ts','open','high','low','close','volume'])
                 df['ts'] = pd.to_datetime(df['ts'], unit='ms')
@@ -522,10 +506,10 @@ class SMCProScanner:
         try:
             df4 = data['4h']; df1 = data['1h']; df15 = data['15m']
             if len(df1) < 80 or len(df15) < 40:
-                debug['gates'].append('❌ Not enough candle data')
+                debug['gates'].append('Not enough candle data')
                 return None, debug
 
-            price = df1['close'].iloc[-1]   # price from 1H now (more stable)
+            price = df1['close'].iloc[-1]
 
             # Gate 1: 4H Bias
             l4 = df4.iloc[-1]
@@ -533,23 +517,26 @@ class SMCProScanner:
             if e21 > e50:       bias = 'LONG'
             elif e21 < e50:     bias = 'SHORT'
             else:
-                debug['gates'].append('❌ 4H EMAs flat — no bias')
+                debug['gates'].append('4H EMAs flat — no bias')
                 return None, debug
             debug['bias'] = bias
 
-            # HH/LL bonus check (not a gate)
+            # HH/LL bonus check
             hh_ll_ok, hh_ll_msg = self.smc.check_4h_hh_ll(df4, bias, HH_LL_LOOKBACK)
             debug['gates'].append(hh_ll_msg)
 
-            # Gate 2: PD Zone
+            # Gate 2: PD Zone — STRICT v4.1
+            # LONG only in DISCOUNT | SHORT only in PREMIUM
             pd_label, pd_pos = self.smc.pd_zone(df4, price)
-            if bias == 'LONG' and pd_label == 'PREMIUM':
-                debug['gates'].append(f'❌ PD zone: PREMIUM ({pd_pos*100:.0f}%) — no longs here')
+            if bias == 'LONG' and pd_label != 'DISCOUNT':
+                self.stats['skipped_zone'] += 1
+                debug['gates'].append(f'BLOCKED — LONG needs DISCOUNT, price is {pd_label} ({pd_pos*100:.0f}%)')
                 return None, debug
-            if bias == 'SHORT' and pd_label == 'DISCOUNT':
-                debug['gates'].append(f'❌ PD zone: DISCOUNT ({pd_pos*100:.0f}%) — no shorts here')
+            if bias == 'SHORT' and pd_label != 'PREMIUM':
+                self.stats['skipped_zone'] += 1
+                debug['gates'].append(f'BLOCKED — SHORT needs PREMIUM, price is {pd_label} ({pd_pos*100:.0f}%)')
                 return None, debug
-            debug['gates'].append(f'✅ PD zone: {pd_label} ({pd_pos*100:.0f}%)')
+            debug['gates'].append(f'Zone OK: {pd_label} ({pd_pos*100:.0f}%)')
 
             # Gate 3: 1H Structure
             highs1, lows1 = self.smc.swing_highs_lows(df1, left=4, right=4)
@@ -558,21 +545,20 @@ class SMCProScanner:
                 s_bull = 'BULL' in structure['kind']
                 s_bear = 'BEAR' in structure['kind']
                 if bias == 'LONG' and s_bear:
-                    debug['gates'].append(f'❌ Structure ({structure["kind"]}) opposes LONG')
+                    debug['gates'].append(f'Structure ({structure["kind"]}) opposes LONG')
                     return None, debug
                 if bias == 'SHORT' and s_bull:
-                    debug['gates'].append(f'❌ Structure ({structure["kind"]}) opposes SHORT')
+                    debug['gates'].append(f'Structure ({structure["kind"]}) opposes SHORT')
                     return None, debug
-                debug['gates'].append(f'✅ Structure: {structure["kind"]}')
+                debug['gates'].append(f'Structure: {structure["kind"]}')
             else:
-                debug['gates'].append('⚠️ No recent BOS/MSS (score=0 but continuing)')
+                debug['gates'].append('No recent BOS/MSS (continuing)')
 
-            # Gate 4: 1H Order Block (HARD GATE)
+            # Gate 4: 1H Order Block
             obs = self.smc.find_order_blocks(df1, bias, lookback=60)
             if not obs:
-                debug['gates'].append(f'❌ No valid {bias} OBs on 1H')
+                debug['gates'].append(f'No valid {bias} OBs on 1H')
                 return None, debug
-            debug['gates'].append(f'✅ {len(obs)} OB(s) found on 1H')
 
             active_ob = None
             for ob in obs:
@@ -580,25 +566,21 @@ class SMCProScanner:
                     active_ob = ob; break
 
             if not active_ob:
-                nearest   = obs[0]
-                dist_pct  = min(abs(price - nearest['top']), abs(price - nearest['bottom'])) / price * 100
-                debug['gates'].append(f'❌ Price not at OB — nearest {dist_pct:.2f}% away [{nearest["bottom"]:.5f}–{nearest["top"]:.5f}]')
+                nearest  = obs[0]
+                dist_pct = min(abs(price - nearest['top']), abs(price - nearest['bottom'])) / price * 100
+                debug['gates'].append(f'Price not at OB — nearest {dist_pct:.2f}% away')
                 return None, debug
-            debug['gates'].append(f'✅ Price IN OB [{active_ob["bottom"]:.5f}–{active_ob["top"]:.5f}]')
+            debug['gates'].append(f'Price IN OB')
 
-            # FVG on 1H (bonus)
+            # FVG bonus
             fvgs = self.smc.find_fvg(df1, bias, lookback=25)
             fvg_near = None
             for fvg in fvgs:
                 if fvg['bottom'] < active_ob['top'] and fvg['top'] > active_ob['bottom']:
                     fvg_near = fvg; break
-            if fvg_near:
-                debug['gates'].append('✅ 1H FVG overlaps OB')
 
-            # Liquidity sweep on 1H
+            # Sweep
             sweep = self.smc.recent_liquidity_sweep(df1, bias, highs1, lows1, lookback=20)
-            if sweep:
-                debug['gates'].append(f'✅ 1H liq sweep @ {sweep["level"]:.5f}')
 
             # Score
             score, reasons, failed = score_setup(
@@ -609,12 +591,12 @@ class SMCProScanner:
             debug['gates'] += failed
 
             if score < MIN_SCORE:
-                debug['gates'].append(f'❌ Score {score} < {MIN_SCORE} minimum')
+                debug['gates'].append(f'Score {score} < {MIN_SCORE}')
                 return None, debug
 
-            if   score >= 92: quality = 'ELITE 👑'
-            elif score >= 85: quality = 'PREMIUM 💎'
-            else:             quality = 'HIGH 🔥'
+            if   score >= 92: quality = 'ELITE'
+            elif score >= 85: quality = 'PREMIUM'
+            else:             quality = 'HIGH'
 
             atr1  = df1['atr'].iloc[-1]
             entry = price
@@ -628,7 +610,7 @@ class SMCProScanner:
 
             risk = abs(entry - sl)
             if risk < entry * 0.001:
-                debug['gates'].append('❌ Degenerate SL')
+                debug['gates'].append('Degenerate SL')
                 return None, debug
 
             if bias == 'LONG':
@@ -664,60 +646,100 @@ class SMCProScanner:
                 'sl_hit':      False,
                 'timestamp':   datetime.now(),
             }
-            debug['gates'].append(f'✅ PASSED — Score {score}')
+            debug['gates'].append(f'PASSED — Score {score}')
             return sig, debug
 
         except Exception as e:
             logger.error(f"Analyse {symbol}: {e}")
-            debug['gates'].append(f'💥 Exception: {e}')
+            debug['gates'].append(f'Exception: {e}')
             return None, debug
 
-    def fmt(self, s):
-        arrow    = '🟢' if s['signal'] == 'LONG' else '🔴'
-        icon     = '🚀' if s['signal'] == 'LONG' else '🔻'
-        bar      = '█' * int(s['score']/10) + '░' * (10 - int(s['score']/10))
-        z        = {'DISCOUNT':'🟩 DISCOUNT','PREMIUM':'🟥 PREMIUM','NEUTRAL':'🟨 NEUTRAL'}.get(s['pd_zone'],'')
-        ob       = s['ob']
-        hh_tag   = '🏔️ Trending (HH/LL ✅)' if s.get('hh_ll') else '〰️ Ranging (no HH/LL)'
+    # ══════════════════════════════════════════════════════════
+    #  SIGNAL CARD — clean, professional, follower-friendly
+    # ══════════════════════════════════════════════════════════
 
-        msg  = f"{'━'*40}\n"
-        msg += f"{icon} <b>SMC PRO v4 — {s['quality']}</b> {icon}\n"
-        msg += f"{'━'*40}\n\n"
-        msg += f"<b>🆔</b> <code>{s['trade_id']}</code>\n"
-        msg += f"<b>📊 PAIR:</b>    <b>#{s['symbol']}USDT</b>\n"
-        msg += f"<b>📍 DIR:</b>     {arrow} <b>{s['signal']}</b>\n"
-        msg += f"<b>🗺️ ZONE:</b>    {z} ({s['pd_pos']*100:.0f}%)\n"
-        msg += f"<b>📐 4H STR:</b>  {hh_tag}\n"
-        msg += f"<b>⏱ ENTRY TF:</b> 1H candle trigger\n\n"
-        msg += f"<b>⭐ SCORE: {s['score']} / 100</b>\n"
-        msg += f"<code>[{bar}]</code>\n\n"
-        msg += f"<b>📦 ORDER BLOCK (1H):</b>\n"
-        msg += f"  Top:    <code>${ob['top']:.6f}</code>\n"
-        msg += f"  Bottom: <code>${ob['bottom']:.6f}</code>\n"
-        msg += f"  Mid:    <code>${ob['mid']:.6f}</code>\n\n"
-        msg += f"<b>💰 ENTRY NOW:</b> <code>${s['entry']:.6f}</code>\n\n"
-        msg += f"<b>🎯 TARGETS:</b>\n"
-        for (lbl, eta), tp, rr in zip(
-            [('TP1 — 50% exit','6-12h'),('TP2 — 30% exit','12-24h'),('TP3 — 20% exit','24-48h')],
-            s['targets'], s['rr']
-        ):
-            pct = abs((tp - s['entry'])/s['entry']*100)
-            msg += f"  <b>{lbl}</b> [{eta}]\n"
-            msg += f"  <code>${tp:.6f}</code>  <b>+{pct:.2f}%</b>  RR {rr:.1f}:1\n\n"
-        msg += f"<b>🛑 STOP LOSS:</b> <code>${s['stop_loss']:.6f}</code>  (-{s['risk_pct']:.2f}%)\n"
-        msg += f"  └ <i>1H close below OB = invalidated</i>\n\n"
+    def fmt(self, s):
+        is_long  = s['signal'] == 'LONG'
+        dir_icon = '🟢 LONG' if is_long else '🔴 SHORT'
+        zone_icon = '🔵 DISCOUNT' if s['pd_zone'] == 'DISCOUNT' else '🟣 PREMIUM'
+
+        quality_map = {
+            'ELITE':   '👑 ELITE',
+            'PREMIUM': '💎 PREMIUM',
+            'HIGH':    '🔥 HIGH',
+        }
+        quality_label = quality_map.get(s['quality'], s['quality'])
+
+        # Score bar
+        filled = int(s['score'] / 10)
+        bar = '█' * filled + '░' * (10 - filled)
+
+        # Structure label
+        struct_label = '—'
         if s['structure']:
-            sk  = s['structure']['kind']
-            lbl = '🔄 MSS — Early Reversal' if 'MSS' in sk else '💥 BOS — Pullback Entry'
-            msg += f"<b>🏗️ STRUCTURE:</b> {lbl}\n\n"
-        msg += f"<b>📋 CONFLUENCE:</b>\n"
-        for r in s['reasons'][:12]:
-            msg += f"  • {r}\n"
-        msg += f"\n<b>⚠️ RISK:</b> 1-2% per trade only\n"
-        msg += f"  Move SL → BE after TP1 hits\n"
-        msg += f"\n<b>📡 Live Tracking: ON</b>\n"
-        msg += f"<i>🕐 {s['timestamp'].strftime('%Y-%m-%d %H:%M UTC')}</i>\n"
-        msg += f"{'━'*40}"
+            sk = s['structure']['kind']
+            struct_label = 'MSS (Reversal)' if 'MSS' in sk else 'BOS (Pullback)'
+
+        # Trigger candle (first reason that mentions "1H")
+        trigger_label = next((r for r in s['reasons'] if '1H' in r), '—')
+
+        # Confluence bullets (clean, no emoji overload)
+        conf_items = [r for r in s['reasons'] if r != trigger_label][:5]
+
+        ob = s['ob']
+        tps = s['targets']
+        rr  = s['rr']
+
+        def pct(a, b):
+            return abs((a - b) / b * 100)
+
+        msg  = "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        msg += f"  {quality_label}  |  {dir_icon}\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        msg += f"<b>#{s['symbol']}USDT  —  Perp Futures</b>\n"
+        msg += f"Zone: {zone_icon}  |  Score: <b>{s['score']}/100</b>\n"
+        msg += f"<code>[{bar}]</code>\n\n"
+
+        msg += "─────────────────────────\n"
+        msg += f"<b>📍 ENTRY</b>\n"
+        msg += f"  <code>${s['entry']:.6f}</code>\n\n"
+
+        msg += f"<b>🎯 TAKE PROFITS</b>\n"
+        msg += f"  TP1 — <code>${tps[0]:.6f}</code>  (+{pct(tps[0], s['entry']):.2f}%)  RR {rr[0]:.1f}:1\n"
+        msg += f"  TP2 — <code>${tps[1]:.6f}</code>  (+{pct(tps[1], s['entry']):.2f}%)  RR {rr[1]:.1f}:1\n"
+        msg += f"  TP3 — <code>${tps[2]:.6f}</code>  (+{pct(tps[2], s['entry']):.2f}%)  RR {rr[2]:.1f}:1\n\n"
+
+        msg += f"<b>🛑 STOP LOSS</b>\n"
+        msg += f"  <code>${s['stop_loss']:.6f}</code>  (-{s['risk_pct']:.2f}%)\n\n"
+
+        msg += "─────────────────────────\n"
+        msg += f"<b>📊 ANALYSIS</b>\n"
+        msg += f"  Structure : {struct_label}\n"
+        msg += f"  OB Zone   : ${ob['bottom']:.6f} – ${ob['top']:.6f}\n"
+        msg += f"  Trigger   : {trigger_label}\n"
+        if s.get('sweep'):
+            msg += f"  Sweep     : Yes — liquidity taken\n"
+        if s.get('fvg'):
+            msg += f"  FVG       : Yes — overlaps OB\n"
+        msg += "\n"
+
+        if conf_items:
+            msg += f"<b>✅ CONFLUENCE</b>\n"
+            for item in conf_items:
+                msg += f"  · {item}\n"
+            msg += "\n"
+
+        msg += "─────────────────────────\n"
+        msg += f"<b>📋 TRADE PLAN</b>\n"
+        msg += f"  · Risk 1–2% of account only\n"
+        msg += f"  · Close 50% at TP1, move SL to entry\n"
+        msg += f"  · Close 30% at TP2, trail the rest\n"
+        msg += f"  · Close final 20% at TP3\n"
+        msg += f"  · 1H close below OB = setup invalidated\n\n"
+
+        msg += f"<i>🕐 {s['timestamp'].strftime('%d %b %Y  %H:%M UTC')}</i>\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━━━━━"
         return msg
 
     async def send(self, text):
@@ -729,17 +751,28 @@ class SMCProScanner:
     async def tp_alert(self, t, n, price):
         tp  = t['targets'][n-1]
         pct = abs((tp - t['entry'])/t['entry']*100)
-        advice = {1:'Close 50% → Move SL to breakeven', 2:'Close 30% → Trail stop tight', 3:'Close final 20% 🎊'}
-        msg  = f"🎯 <b>TP{n} HIT!</b>\n\n<code>{t['trade_id']}</code>\n<b>{t['symbol']}</b> {t['signal']}\n\n"
-        msg += f"Target: <code>${tp:.6f}</code>\nCurrent: <code>${price:.6f}</code>\nProfit: <b>+{pct:.2f}%</b>\n\n"
-        msg += f"📋 {advice[n]}"
+        advice = {
+            1: 'Close 50% of position\nMove SL to entry (breakeven)',
+            2: 'Close 30% of position\nTrail stop tightly',
+            3: 'Close final 20% — trade complete 🎊'
+        }
+        dir_icon = '🟢' if t['signal'] == 'LONG' else '🔴'
+        msg  = f"🎯 <b>TP{n} HIT — #{t['symbol']}USDT</b>\n\n"
+        msg += f"{dir_icon} {t['signal']}  |  Score {t['score']}\n\n"
+        msg += f"Target   : <code>${tp:.6f}</code>\n"
+        msg += f"Price    : <code>${price:.6f}</code>\n"
+        msg += f"Profit   : <b>+{pct:.2f}%</b>\n\n"
+        msg += f"📋 Next step:\n{advice[n]}"
         await self.send(msg)
         self.stats[f'tp{n}'] += 1
 
     async def sl_alert(self, t, price):
         loss = abs((price - t['entry'])/t['entry']*100)
-        msg  = f"⛔ <b>STOP LOSS HIT</b>\n\n<code>{t['trade_id']}</code>\n<b>{t['symbol']}</b> {t['signal']}\n\n"
-        msg += f"Entry: <code>${t['entry']:.6f}</code>\nLoss: <b>-{loss:.2f}%</b>\n\nOB invalidated. Next setup incoming."
+        dir_icon = '🟢' if t['signal'] == 'LONG' else '🔴'
+        msg  = f"⛔ <b>STOP LOSS — #{t['symbol']}USDT</b>\n\n"
+        msg += f"{dir_icon} {t['signal']}  |  Entry <code>${t['entry']:.6f}</code>\n\n"
+        msg += f"Loss     : <b>-{loss:.2f}%</b>\n"
+        msg += f"OB invalidated — wait for next setup."
         await self.send(msg)
         self.stats['sl'] += 1
 
@@ -753,7 +786,10 @@ class SMCProScanner:
                 for tid, t in list(self.active_trades.items()):
                     try:
                         if datetime.now() - t['timestamp'] > timedelta(hours=48):
-                            await self.send(f"⏰ <b>48H TIMEOUT</b>\n<code>{tid}</code>\n{t['symbol']} — Close manually.")
+                            await self.send(
+                                f"⏰ <b>48H TIMEOUT — #{t['symbol']}USDT</b>\n"
+                                f"Close manually if still open."
+                            )
                             remove.append(tid); continue
                         ticker = await self.exchange.fetch_ticker(t['full_symbol'])
                         p = ticker['last']
@@ -786,10 +822,9 @@ class SMCProScanner:
         logger.info("🔍 Scan starting...")
 
         await self.send(
-            f"🔍 <b>SMC v4.0 SCAN STARTED</b>\n"
-            f"Entry: <b>1H trigger</b> | Structure: 1H | Trend: 4H\n"
-            f"Min score: {MIN_SCORE} | OB tol: {OB_TOLERANCE_PCT*100:.1f}%\n"
-            f"Vol filter: ${MIN_VOLUME_24H/1e6:.0f}M | HH/LL bonus: +{HH_LL_BONUS}pts"
+            f"🔍 <b>SMC v4.1 SCANNING</b>\n"
+            f"LONG = Discount zone only  |  SHORT = Premium zone only\n"
+            f"Min score: {MIN_SCORE}  |  Dup cooldown: {DUPLICATE_COOLDOWN_H}h"
         )
 
         pairs       = await self.get_pairs()
@@ -803,10 +838,19 @@ class SMCProScanner:
                 if data:
                     sig, dbg = self.analyse(data, pair)
                     if sig:
+                        sym = sig['symbol']
+                        dir = sig['signal']
+
+                        # ── Duplicate guard ──────────────────────────────
+                        if self.is_duplicate(sym, dir):
+                            logger.info(f"  ⏭ Dup skipped: {sym} {dir}")
+                            self.stats['skipped_dup'] += 1
+                            continue
+
                         candidates.append(sig)
-                        logger.info(f"  💎 {pair} {sig['signal']} score={sig['score']}")
+                        logger.info(f"  💎 {pair} {dir} score={sig['score']}")
                     else:
-                        if dbg['score'] > 0 and any('✅ Price IN OB' in g for g in dbg['gates']):
+                        if dbg['score'] > 0:
                             near_misses.append(dbg)
                 scanned += 1
                 if scanned % 30 == 0:
@@ -824,34 +868,36 @@ class SMCProScanner:
         for sig in top:
             self.signal_history.append(sig)
             self.active_trades[sig['trade_id']] = sig
+            self.mark_sent(sig['symbol'], sig['signal'])   # register duplicate guard
             self.stats['total'] += 1
             self.stats[sig['signal'].lower()] += 1
-            if 'ELITE'   in sig['quality']: self.stats['elite']   += 1
-            elif 'PREMIUM' in sig['quality']: self.stats['premium'] += 1
+            if sig['quality'] == 'ELITE':    self.stats['elite']   += 1
+            elif sig['quality'] == 'PREMIUM': self.stats['premium'] += 1
             else:                             self.stats['high']    += 1
             await self.send(self.fmt(sig))
             await asyncio.sleep(2)
 
-        self.stats['last_scan'] = datetime.now()
+        self.stats['last_scan']     = datetime.now()
         self.stats['pairs_scanned'] = scanned
 
-        el = sum(1 for s in top if 'ELITE'   in s['quality'])
-        pr = sum(1 for s in top if 'PREMIUM' in s['quality'])
+        el = sum(1 for s in top if s['quality'] == 'ELITE')
+        pr = sum(1 for s in top if s['quality'] == 'PREMIUM')
         hi = len(top) - el - pr
         lg = sum(1 for s in top if s['signal'] == 'LONG')
-        tr = sum(1 for s in top if s.get('hh_ll'))
 
-        summ  = f"✅ <b>SCAN COMPLETE — v4.0</b>\n\n"
-        summ += f"📊 Pairs scanned: {scanned}\n"
-        summ += f"🔍 Candidates:    {len(candidates)}\n"
-        summ += f"🎯 Signals sent:  {len(top)}\n"
+        summ  = f"✅ <b>SCAN COMPLETE</b>\n\n"
+        summ += f"Pairs scanned : {scanned}\n"
+        summ += f"Signals sent  : {len(top)}\n"
         if top:
-            summ += f"  👑 Elite:    {el}\n  💎 Premium:  {pr}\n  🔥 High:     {hi}\n"
-            summ += f"  🟢 Long:     {lg}\n  🔴 Short:    {len(top)-lg}\n"
-            summ += f"  🏔️ Trending: {tr}\n  〰️ Ranging:  {len(top)-tr}\n"
+            summ += f"  👑 Elite   : {el}\n"
+            summ += f"  💎 Premium : {pr}\n"
+            summ += f"  🔥 High    : {hi}\n"
+            summ += f"  🟢 Long    : {lg}  |  🔴 Short : {len(top)-lg}\n"
         else:
-            summ += f"\n<i>No setups met criteria this scan.</i>\n"
-            summ += f"Near misses: {len(near_misses)} — use /debug\n"
+            summ += f"\n<i>No setups met criteria.</i>\n"
+            summ += f"Skipped (zone) : {self.stats['skipped_zone']}\n"
+            summ += f"Skipped (dup)  : {self.stats['skipped_dup']}\n"
+            summ += f"Near misses    : {len(near_misses)} — use /debug\n"
         summ += f"\n⏰ {datetime.now().strftime('%H:%M UTC')}"
         await self.send(summ)
 
@@ -860,20 +906,18 @@ class SMCProScanner:
         return top
 
     async def run(self, interval_min=SCAN_INTERVAL_MIN):
-        logger.info("🚀 SMC Pro v4.0 starting")
+        logger.info("🚀 SMC Pro v4.1 starting")
         await self.send(
-            "👑 <b>SMC PRO v4.0 — ORDER BLOCK SCANNER</b> 👑\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>4H Trend  →  1H Structure + OB + Entry  →  15M Vol</b>\n\n"
-            f"✅ Entry trigger: <b>1H candles</b> (upgraded from 15M)\n"
-            f"✅ Min score: {MIN_SCORE}/100\n"
-            f"✅ OB tolerance: {OB_TOLERANCE_PCT*100:.1f}%\n"
-            f"✅ Vol filter: ${MIN_VOLUME_24H/1e6:.0f}M/day\n"
-            f"✅ 4H HH/LL bonus: +{HH_LL_BONUS}pts\n"
-            f"✅ Trade timeout: 48H\n"
-            f"✅ Scan every: {SCAN_INTERVAL_MIN} min\n\n"
+            "👑 <b>SMC PRO v4.1 — LIVE</b>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "<b>4H Trend  →  1H OB + Structure + Entry  →  15M Vol</b>\n\n"
+            "🔵 LONG  : Discount zone only\n"
+            "🟣 SHORT : Premium zone only\n"
+            f"📵 Dup filter : {DUPLICATE_COOLDOWN_H}h cooldown\n"
+            f"⭐ Min score : {MIN_SCORE}/100\n"
+            f"⏱ Scan every : {SCAN_INTERVAL_MIN} min\n\n"
             "Commands: /scan /stats /trades /debug /help\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            "━━━━━━━━━━━━━━━━━━━━━━━━"
         )
         asyncio.create_task(self.track())
         while True:
@@ -898,30 +942,37 @@ class Commands:
 
     async def start(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(
-            "👑 <b>SMC Pro v4.0</b>\n\n"
-            "1H entry trigger — cleaner, stronger signals.\n\n"
-            "Stack: 4H trend → 1H structure + OB + trigger → 15M vol\n\n"
+            "👑 <b>SMC Pro v4.1</b>\n\n"
+            "Only the cleanest OB setups.\n"
+            "LONG from Discount · SHORT from Premium\n"
+            "No duplicate signals.\n\n"
             "/scan /stats /trades /debug /help",
             parse_mode=ParseMode.HTML
         )
 
     async def cmd_scan(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         if self.s.is_scanning:
-            await u.message.reply_text("⚠️ Already scanning."); return
+            await u.message.reply_text("⚠️ Scan already running."); return
         await u.message.reply_text("🔍 Manual scan started...")
         asyncio.create_task(self.s.scan())
 
     async def stats(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         s = self.s.stats
-        msg  = "📊 <b>SMC PRO v4.0 STATS</b>\n\n"
-        msg += f"Total signals: {s['total']}\n"
-        msg += f"  👑 Elite: {s['elite']}  💎 Premium: {s['premium']}  🔥 High: {s['high']}\n"
-        msg += f"  🟢 Long: {s['long']}  🔴 Short: {s['short']}\n\n"
-        msg += f"TP1: {s['tp1']} | TP2: {s['tp2']} | TP3: {s['tp3']} | SL: {s['sl']}\n\n"
+        msg  = "📊 <b>SMC PRO v4.1 — STATS</b>\n\n"
+        msg += f"Total signals  : {s['total']}\n"
+        msg += f"  👑 Elite     : {s['elite']}\n"
+        msg += f"  💎 Premium   : {s['premium']}\n"
+        msg += f"  🔥 High      : {s['high']}\n\n"
+        msg += f"  🟢 Long      : {s['long']}\n"
+        msg += f"  🔴 Short     : {s['short']}\n\n"
+        msg += f"TP1 : {s['tp1']}  TP2 : {s['tp2']}  TP3 : {s['tp3']}\n"
+        msg += f"SL  : {s['sl']}\n\n"
+        msg += f"Skipped (zone) : {s['skipped_zone']}\n"
+        msg += f"Skipped (dup)  : {s['skipped_dup']}\n\n"
         if s['last_scan']:
-            msg += f"Last scan: {s['last_scan'].strftime('%H:%M UTC')}\n"
-            msg += f"Pairs: {s['pairs_scanned']}\n"
-        msg += f"Active: {len(self.s.active_trades)}"
+            msg += f"Last scan : {s['last_scan'].strftime('%H:%M UTC')}\n"
+            msg += f"Pairs     : {s['pairs_scanned']}\n"
+        msg += f"Active trades : {len(self.s.active_trades)}"
         await u.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
     async def trades(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -929,55 +980,53 @@ class Commands:
             await u.message.reply_text("📭 No active trades."); return
         msg = f"📡 <b>ACTIVE TRADES ({len(self.s.active_trades)})</b>\n\n"
         for tid, t in list(self.s.active_trades.items())[:10]:
-            age      = int((datetime.now() - t['timestamp']).total_seconds()/3600)
-            tps      = ''.join(['✅' if h else '⏳' for h in t['tp_hit']])
-            trend_tag = '🏔️' if t.get('hh_ll') else '〰️'
-            msg += (f"<b>{t['symbol']}</b> {t['signal']} {trend_tag} — {t['quality']}\n"
-                    f"  Entry: <code>${t['entry']:.5f}</code> | Score: {t['score']}\n"
-                    f"  TPs: {tps} | {age}h old\n\n")
+            age  = int((datetime.now() - t['timestamp']).total_seconds() / 3600)
+            tps  = ''.join(['✅' if h else '⏳' for h in t['tp_hit']])
+            icon = '🟢' if t['signal'] == 'LONG' else '🔴'
+            msg += (
+                f"<b>#{t['symbol']}USDT</b>  {icon} {t['signal']}  [{t['quality']}]\n"
+                f"  Entry : <code>${t['entry']:.5f}</code>  Score : {t['score']}\n"
+                f"  TPs   : {tps}  |  Age : {age}h\n\n"
+            )
         await u.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
     async def debug(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         if not self.s.last_debug:
-            await u.message.reply_text("📭 No debug data yet. Run /scan first.", parse_mode=ParseMode.HTML)
+            await u.message.reply_text("📭 No debug data. Run /scan first.")
             return
-        msg = "🔬 <b>NEAR MISSES — Last Scan</b>\n"
-        msg += "<i>(At OB but below score threshold)</i>\n\n"
+        msg = "🔬 <b>NEAR MISSES — Last Scan</b>\n\n"
         for d in self.s.last_debug[:8]:
-            msg += f"<b>{d['symbol']}</b> {d['bias']} — Score: {d['score']}/100\n"
-            for g in d['gates'][-4:]:
-                msg += f"  {g}\n"
+            msg += f"<b>{d['symbol']}</b>  {d['bias']}  Score: {d['score']}/100\n"
+            for g in d['gates'][-3:]:
+                msg += f"  · {g}\n"
             msg += "\n"
-        msg += f"<i>Min score: {MIN_SCORE}. 1H trigger = up to +25pts.</i>"
         await u.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
     async def help(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        msg  = "📚 <b>SMC PRO v4.0 — STRATEGY</b>\n\n"
-        msg += "<b>Timeframe Stack:</b>\n"
-        msg += "  4H  → EMA bias + HH/LL depth\n"
-        msg += "  1H  → BOS/MSS + OB zone + Entry trigger  ← core\n"
-        msg += "  15M → Volume spike bonus only\n\n"
-        msg += "<b>Hard Gates (ALL must pass):</b>\n"
-        msg += "  1️⃣ 4H EMA 21/50 bias\n"
-        msg += "  2️⃣ PD zone (no longs premium / no shorts discount)\n"
-        msg += "  3️⃣ 1H BOS/MSS within 20 candles\n"
-        msg += "  4️⃣ Price at valid 1H Order Block\n"
-        msg += f"  5️⃣ Score ≥ {MIN_SCORE}/100\n\n"
-        msg += "<b>Score System (max 100):</b>\n"
-        msg += "  +25 — 1H entry trigger (engulf/pin/hammer) ⭐ main\n"
-        msg += "  +20 — MSS structure\n"
-        msg += "  +20 — Tight OB quality\n"
-        msg += "  +15 — 4H triple EMA\n"
-        msg += f"  +{HH_LL_BONUS}  — 4H HH/LL confirmed\n"
-        msg += "  +12 — Momentum (RSI/MACD/Stoch)\n"
-        msg += "  +10 — Extras (sweep/FVG/vol)\n\n"
-        msg += "<b>TP timing adjusted for 1H entries:</b>\n"
-        msg += "  TP1 = 1:1.5 RR  [6-12h]\n"
-        msg += "  TP2 = 1:2.5 RR  [12-24h]\n"
-        msg += "  TP3 = 1:4.0 RR  [24-48h]\n\n"
-        msg += "<b>Config:</b>\n"
-        msg += f"  MIN_SCORE={MIN_SCORE} | HH_LL_BONUS={HH_LL_BONUS}\n"
-        msg += f"  OB_TOLERANCE={OB_TOLERANCE_PCT} | LOOKBACK={HH_LL_LOOKBACK}"
+        msg  = "📚 <b>SMC PRO v4.1 — HOW IT WORKS</b>\n\n"
+        msg += "<b>Timeframe Stack</b>\n"
+        msg += "  4H  → Trend bias (EMA) + HH/LL\n"
+        msg += "  1H  → Structure (BOS/MSS) + OB + Trigger\n"
+        msg += "  15M → Volume spike bonus\n\n"
+        msg += "<b>Hard Rules</b>\n"
+        msg += "  · LONG signals: Discount zone only (bottom 40%)\n"
+        msg += "  · SHORT signals: Premium zone only (top 40%)\n"
+        msg += "  · Neutral zone: always skipped\n"
+        msg += f"  · Same signal won't repeat for {DUPLICATE_COOLDOWN_H}h\n"
+        msg += f"  · Minimum score: {MIN_SCORE}/100\n\n"
+        msg += "<b>Score Breakdown</b>\n"
+        msg += "  25 pts — 1H entry candle (engulf/pin/hammer)\n"
+        msg += "  20 pts — MSS/BOS structure\n"
+        msg += "  20 pts — Order Block quality\n"
+        msg += "  15 pts — 4H trend alignment\n"
+        msg += f"  {HH_LL_BONUS} pts  — 4H Higher High / Lower Low\n"
+        msg += "  12 pts — Momentum (RSI / MACD / Stoch)\n"
+        msg += "  10 pts — Extras (sweep / FVG / vol)\n\n"
+        msg += "<b>Trade Management</b>\n"
+        msg += "  TP1 = 1:1.5 RR  — Close 50%\n"
+        msg += "  TP2 = 1:2.5 RR  — Close 30%\n"
+        msg += "  TP3 = 1:4.0 RR  — Close 20%\n"
+        msg += "  Always risk 1-2% of account per trade\n"
         await u.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 
@@ -1012,7 +1061,7 @@ async def main():
 
     await app.initialize()
     await app.start()
-    logger.info("🤖 SMC Pro v4.0 ready!")
+    logger.info("🤖 SMC Pro v4.1 ready!")
 
     try:
         await scanner.run(interval_min=SCAN_INTERVAL_MIN)
