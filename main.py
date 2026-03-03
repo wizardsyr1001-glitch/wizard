@@ -1,74 +1,21 @@
 """
-SMC PRO SCANNER v4.3 — "LIQUIDITY AWARENESS"
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CHANGES from v4.2  (engine only — signal card unchanged):
+SMC PRO SCANNER v4.0
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CHANGES from v3.2:
+  - Entry trigger moved 15M → 1H for higher accuracy signals
+  - 1H engulfing/pin/hammer now the primary trigger (was 15M)
+  - 15M kept only for volume spike confirmation bonus
+  - 1H trigger worth +25 pts (was +20) — reflects higher timeframe weight
+  - OB detection remains on 1H (unchanged)
+  - 4H HH/LL stays as +8 score bonus (not a hard gate)
+  - MIN_SCORE raised 72 → 75 (1H triggers are stronger, bar is higher)
+  - Scan stack: 4H trend → 1H structure + OB + trigger → 15M volume bonus
 
-  3 NEW ACCURACY UPGRADES from LuxAlgo SMC analysis:
-  ────────────────────────────────────────────────────
-
-  1. EQUAL HIGHS / EQUAL LOWS (EQH/EQL) — Liquidity Awareness
-     ──────────────────────────────────────────────────────────
-     Detects when price has formed two highs or lows at nearly
-     the same level. This means LIQUIDITY IS RESTING THERE.
-     Smart money will hunt it before moving the real direction.
-
-     Logic (your choice: both — bonus if swept, block if not):
-       EQH above price + NOT yet swept → block LONG
-         (price will likely get swept up first = bad entry)
-       EQH above price + ALREADY swept → +6 pts bonus for LONG
-         (liquidity cleared = fuel for real move up)
-       EQL below price + NOT yet swept → block SHORT
-         (price will likely get swept down first = bad entry)
-       EQL below price + ALREADY swept → +6 pts bonus for SHORT
-         (liquidity cleared = fuel for real move down)
-
-     Detection method:
-       Swing highs within EQH_THRESHOLD * ATR of each other
-       within last EQH_LOOKBACK candles = Equal High
-       Same logic for Equal Lows
-
-  2. STRONG / WEAK HIGH & LOW labelling
-     ─────────────────────────────────────
-     Every swing point is now classified:
-       Strong High = price broke ABOVE it (BOS confirmed)
-                   → this level is now support, not resistance
-       Weak High   = price has NOT broken above it yet
-                   → liquidity sitting above, danger for longs
-       Strong Low  = price broke BELOW it (BOS confirmed)
-                   → this level is now resistance, not support
-       Weak Low    = price has NOT broken below it yet
-                   → liquidity sitting below, danger for shorts
-
-     How it affects signals:
-       LONG entry with a Weak High directly above OB  → -6 pts
-         (price likely to get swept up before real move)
-       LONG entry with nearest Strong Low below entry → +5 pts
-         (solid structural support underneath)
-       SHORT entry with a Weak Low directly below OB  → -6 pts
-       SHORT entry with nearest Strong High above     → +5 pts
-
-  3. VOLATILITY OB FILTER (from LuxAlgo)
-     ──────────────────────────────────────
-     If a candle's range > 2x ATR it's a high-volatility
-     (news spike) candle. OBs formed on these candles are
-     unreliable — price moved due to news not structure.
-     These candles are now EXCLUDED from OB detection.
-
-     Effect: Fewer but significantly higher quality OBs.
-     Wide-range news candles no longer pollute the OB list.
-
-TUNABLE SETTINGS (new):
-  EQH_LOOKBACK      = 30   candles to look back for EQH/EQL
-  EQH_THRESHOLD     = 0.5  ATR multiplier for "equal" tolerance
-  WEAK_HIGH_WINDOW  = 10   candles ahead of OB to check for weak high
-  VOL_OB_FILTER_ATR = 2.0  candle range multiplier to flag news spike
-
-TIMEFRAME ROLES v4.3: (unchanged from v4.2)
-  BTC 4H/1H/15M → Full SMC king filter
-  ALT 4H  → EMA bias + HH/LL
-  ALT 1H  → BOS/MSS + OB (volatility filtered) + EQH/EQL + Strong/Weak + trigger
-  ALT 15M → Volume bonus
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TIMEFRAME ROLES v4.0:
+  4H  → Trend bias (EMA) + HH/LL structure depth
+  1H  → BOS/MSS + Order Block zone + Entry trigger candle  ← KEY CHANGE
+  15M → Volume spike bonus only
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 import asyncio
@@ -89,11 +36,11 @@ logger = logging.getLogger(__name__)
 import warnings
 warnings.filterwarnings('ignore')
 
-# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════
 #  TUNABLE SETTINGS
-# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════
 MAX_SIGNALS_PER_SCAN  = 6
-MIN_SCORE             = 75
+MIN_SCORE             = 75       # raised from 72 — 1H triggers are stronger
 MIN_VOLUME_24H        = 5_000_000
 OB_TOLERANCE_PCT      = 0.008
 OB_IMPULSE_ATR_MULT   = 1.0
@@ -102,43 +49,10 @@ SCAN_INTERVAL_MIN     = 30
 HH_LL_LOOKBACK        = 10
 HH_LL_BONUS           = 8
 
-# ── BTC filter thresholds ───────────────────────────────────────
-BTC_HARD_BLOCK_1H_PCT = 2.5    # instant block if BTC 1H candle moves this %
-BTC_HARD_BLOCK_3H_PCT = 3.0    # block if BTC strong trend + 3H move this %
 
-# Score modifier table per BTC regime (LONG side, SHORT is mirrored)
-BTC_REGIME_SCORES = {
-    #  regime              LONG   SHORT
-    'BULL_CONFIRMED':    ( +15,   -18),
-    'BULL_STRUCTURE':    ( +10,   -12),
-    'BULL_RANGING':      (  +5,    -6),
-    'BEAR_CONFIRMED':    ( -18,   +15),
-    'BEAR_STRUCTURE':    ( -12,   +10),
-    'BEAR_RANGING':      (  -6,    +5),
-    'REVERSAL_BULL':     (  +8,   -10),
-    'REVERSAL_BEAR':     ( -10,    +8),
-    'RANGING':           (   0,     0),
-}
-
-BTC_OB_BONUS     = 5   # BTC at own OB aligned with signal direction
-BTC_SWEEP_BONUS  = 4   # BTC just swept liquidity (cleared stops)
-BTC_FVG_BONUS    = 3   # BTC has open FVG in signal direction
-BTC_VOL_BONUS    = 2   # BTC 15M volume spike
-
-# ── v4.3 Liquidity Awareness Settings ──────────────────────────
-EQH_LOOKBACK        = 30    # candles to scan back for equal highs/lows
-EQH_THRESHOLD       = 0.5   # ATR multiplier — how close = "equal"
-EQL_SWEPT_BONUS     = 6     # pts bonus when EQH/EQL already swept (fuel)
-EQL_UNSWEPT_BLOCK   = True  # hard block if unswept EQH/EQL directly in signal path
-WEAK_LEVEL_PENALTY  = 6     # pts penalty — weak high/low sitting in signal path
-STRONG_LEVEL_BONUS  = 5     # pts bonus — strong high/low as structural support
-WEAK_LEVEL_WINDOW   = 15    # candles above/below OB to check for weak high/low
-VOL_OB_FILTER_ATR   = 2.0   # candle range > this * ATR = news spike, skip as OB
-
-
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 #  INDICATORS
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 
 def add_indicators(df):
     if len(df) < 55:
@@ -158,9 +72,7 @@ def add_indicators(df):
         df['srsi_k'] = stoch.stochrsi_k()
         df['srsi_d'] = stoch.stochrsi_d()
 
-        df['atr'] = ta.volatility.AverageTrueRange(
-            df['high'], df['low'], df['close']
-        ).average_true_range()
+        df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close']).average_true_range()
 
         bb = ta.volatility.BollingerBands(df['close'], 20, 2)
         df['bb_upper'] = bb.bollinger_hband()
@@ -172,12 +84,8 @@ def add_indicators(df):
         df['di_pos'] = adx_i.adx_pos()
         df['di_neg'] = adx_i.adx_neg()
 
-        df['cmf'] = ta.volume.ChaikinMoneyFlowIndicator(
-            df['high'], df['low'], df['close'], df['volume']
-        ).chaikin_money_flow()
-        df['mfi'] = ta.volume.MFIIndicator(
-            df['high'], df['low'], df['close'], df['volume']
-        ).money_flow_index()
+        df['cmf'] = ta.volume.ChaikinMoneyFlowIndicator(df['high'], df['low'], df['close'], df['volume']).chaikin_money_flow()
+        df['mfi'] = ta.volume.MFIIndicator(df['high'], df['low'], df['close'], df['volume']).money_flow_index()
 
         df['vol_sma']   = df['volume'].rolling(20).mean()
         df['vol_ratio'] = df['volume'] / df['vol_sma'].replace(0, np.nan)
@@ -189,6 +97,7 @@ def add_indicators(df):
         uw   = df['high'] - df[['open','close']].max(axis=1)
         lw   = df[['open','close']].min(axis=1) - df['low']
 
+        # ── Trigger candles (now used on 1H) ──────────────────
         df['bull_engulf'] = (
             (df['close'].shift(1) < df['open'].shift(1)) &
             (df['close'] > df['open']) &
@@ -224,9 +133,9 @@ def add_indicators(df):
     return df
 
 
-# ══════════════════════════════════════════════════════════════════
-#  SMC ENGINE  (shared by both ALT and BTC analysis)
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+#  SMC ENGINE
+# ══════════════════════════════════════════════════════════════
 
 class SMCEngine:
 
@@ -245,19 +154,19 @@ class SMCEngine:
     def check_4h_hh_ll(self, df_4h, direction, lookback=HH_LL_LOOKBACK):
         n = len(df_4h)
         if n < lookback * 2:
-            return False, "⚠️ Not enough 4H data for HH/LL"
+            return False, "⚠️ Not enough 4H data for HH/LL check"
         recent = df_4h.iloc[-lookback:]
         prior  = df_4h.iloc[-(lookback * 2):-lookback]
         if direction == 'LONG':
             rh, ph = recent['high'].max(), prior['high'].max()
             if rh > ph:
-                return True, f"📈 4H HH ({ph:.2f} → {rh:.2f}) +{HH_LL_BONUS}pts"
-            return False, f"➖ 4H no HH ({rh:.2f} ≤ {ph:.2f}) ranging"
+                return True,  f"📈 4H Higher High ({ph:.5f} → {rh:.5f}) +{HH_LL_BONUS}pts"
+            return False, f"➖ 4H no HH ({rh:.5f} ≤ {ph:.5f}) — ranging"
         else:
             rl, pl = recent['low'].min(), prior['low'].min()
             if rl < pl:
-                return True, f"📉 4H LL ({pl:.2f} → {rl:.2f}) +{HH_LL_BONUS}pts"
-            return False, f"➖ 4H no LL ({rl:.2f} ≥ {pl:.2f}) ranging"
+                return True,  f"📉 4H Lower Low ({pl:.5f} → {rl:.5f}) +{HH_LL_BONUS}pts"
+            return False, f"➖ 4H no LL ({rl:.5f} ≥ {pl:.5f}) — ranging"
 
     def detect_structure_break(self, df, highs, lows, lookback=STRUCTURE_LOOKBACK):
         events = []
@@ -299,11 +208,7 @@ class SMCEngine:
 
         for i in range(start, n - 3):
             c = df.iloc[i]
-            atr_local = (
-                df['atr'].iloc[i]
-                if 'atr' in df.columns and not pd.isna(df['atr'].iloc[i])
-                else (c['high'] - c['low'])
-            )
+            atr_local = df['atr'].iloc[i] if 'atr' in df.columns and not pd.isna(df['atr'].iloc[i]) else (c['high'] - c['low'])
             min_impulse = atr_local * OB_IMPULSE_ATR_MULT
 
             if direction == 'LONG':
@@ -316,7 +221,8 @@ class SMCEngine:
                     'mid':   (max(c['open'], c['close']) + c['low']) / 2,
                     'bar':    i
                 }
-                if (df['close'].iloc[i+1:n] < (ob['top']+ob['bottom'])/2).any(): continue
+                ob_50 = (ob['top'] + ob['bottom']) / 2
+                if (df['close'].iloc[i+1:n] < ob_50).any(): continue
                 obs.append(ob)
             else:
                 if c['close'] <= c['open']: continue
@@ -328,7 +234,8 @@ class SMCEngine:
                     'mid':   (c['high'] + min(c['open'], c['close'])) / 2,
                     'bar':    i
                 }
-                if (df['close'].iloc[i+1:n] > (ob['top']+ob['bottom'])/2).any(): continue
+                ob_50 = (ob['top'] + ob['bottom']) / 2
+                if (df['close'].iloc[i+1:n] > ob_50).any(): continue
                 obs.append(ob)
 
         obs.sort(key=lambda x: x['bar'], reverse=True)
@@ -344,15 +251,11 @@ class SMCEngine:
         for i in range(max(1, n - lookback), n - 1):
             prev = df.iloc[i-1]; nxt = df.iloc[i+1]
             if direction == 'LONG' and prev['high'] < nxt['low']:
-                fvgs.append({
-                    'top': nxt['low'], 'bottom': prev['high'],
-                    'mid': (nxt['low'] + prev['high']) / 2, 'bar': i
-                })
+                fvgs.append({'top': nxt['low'], 'bottom': prev['high'],
+                             'mid': (nxt['low'] + prev['high']) / 2, 'bar': i})
             elif direction == 'SHORT' and prev['low'] > nxt['high']:
-                fvgs.append({
-                    'top': prev['low'], 'bottom': nxt['high'],
-                    'mid': (prev['low'] + nxt['high']) / 2, 'bar': i
-                })
+                fvgs.append({'top': prev['low'], 'bottom': nxt['high'],
+                             'mid': (prev['low'] + nxt['high']) / 2, 'bar': i})
         return fvgs
 
     def recent_liquidity_sweep(self, df, direction, highs, lows, lookback=25):
@@ -386,614 +289,23 @@ class SMCEngine:
         elif pos > 0.60: return 'PREMIUM',  pos
         return 'NEUTRAL', pos
 
-    # ══════════════════════════════════════════════
-    #  v4.3 NEW METHODS
-    # ══════════════════════════════════════════════
 
-    def is_volatility_candle(self, df, i):
-        """
-        Returns True if candle i is a high-volatility news spike.
-        Range > VOL_OB_FILTER_ATR * ATR = unreliable OB source.
-        Inspired by LuxAlgo's parsedHigh/parsedLow filter.
-        """
-        if 'atr' not in df.columns: return False
-        atr = df['atr'].iloc[i]
-        if pd.isna(atr) or atr == 0: return False
-        candle_range = df['high'].iloc[i] - df['low'].iloc[i]
-        return candle_range > VOL_OB_FILTER_ATR * atr
-
-    def find_order_blocks_filtered(self, df, direction, lookback=60):
-        """
-        find_order_blocks with volatility spike filtering.
-        OBs formed on news candles (range > 2x ATR) are excluded.
-        Same logic as base method — just skips high-vol candles.
-        """
-        obs = []
-        n = len(df)
-        start = max(2, n - lookback)
-
-        for i in range(start, n - 3):
-            # ── v4.3: skip news spike candles as OB source ─────
-            if self.is_volatility_candle(df, i):
-                continue
-            # ───────────────────────────────────────────────────
-
-            c = df.iloc[i]
-            atr_local = (
-                df['atr'].iloc[i]
-                if 'atr' in df.columns and not pd.isna(df['atr'].iloc[i])
-                else (c['high'] - c['low'])
-            )
-            min_impulse = atr_local * OB_IMPULSE_ATR_MULT
-
-            if direction == 'LONG':
-                if c['close'] >= c['open']: continue
-                fwd_high = df['high'].iloc[i+1:min(i+5, n)].max()
-                if fwd_high - c['low'] < min_impulse: continue
-                ob = {
-                    'top':    max(c['open'], c['close']),
-                    'bottom': c['low'],
-                    'mid':   (max(c['open'], c['close']) + c['low']) / 2,
-                    'bar':    i,
-                    'vol_filtered': True
-                }
-                if (df['close'].iloc[i+1:n] < (ob['top']+ob['bottom'])/2).any(): continue
-                obs.append(ob)
-            else:
-                if c['close'] <= c['open']: continue
-                fwd_low = df['low'].iloc[i+1:min(i+5, n)].min()
-                if c['high'] - fwd_low < min_impulse: continue
-                ob = {
-                    'top':    c['high'],
-                    'bottom': min(c['open'], c['close']),
-                    'mid':   (c['high'] + min(c['open'], c['close'])) / 2,
-                    'bar':    i,
-                    'vol_filtered': True
-                }
-                if (df['close'].iloc[i+1:n] > (ob['top']+ob['bottom'])/2).any(): continue
-                obs.append(ob)
-
-        obs.sort(key=lambda x: x['bar'], reverse=True)
-        return obs
-
-    def detect_equal_highs_lows(self, df, highs, lows, lookback=None):
-        """
-        Detect Equal Highs (EQH) and Equal Lows (EQL).
-        Two swing points are 'equal' if within EQH_THRESHOLD * ATR.
-        Returns lists of EQH and EQL price levels with sweep status.
-
-        Each entry: {'level': float, 'swept': bool, 'bar': int}
-        'swept' = True if price has already traded through the level
-        """
-        if lookback is None: lookback = EQH_LOOKBACK
-        n   = len(df)
-        atr = df['atr'].iloc[-1] if 'atr' in df.columns else (df['high'].iloc[-1] - df['low'].iloc[-1])
-        if pd.isna(atr) or atr == 0: atr = df['close'].iloc[-1] * 0.001
-        threshold = EQH_THRESHOLD * atr
-
-        price     = df['close'].iloc[-1]
-        start_bar = max(0, n - lookback)
-
-        recent_highs = [h for h in highs if h['i'] >= start_bar]
-        recent_lows  = [l for l in lows  if l['i'] >= start_bar]
-
-        eqh_list = []
-        eql_list = []
-
-        # Equal Highs — two swing highs within threshold of each other
-        for i in range(len(recent_highs)):
-            for j in range(i+1, len(recent_highs)):
-                h1 = recent_highs[i]; h2 = recent_highs[j]
-                if abs(h1['price'] - h2['price']) <= threshold:
-                    level = (h1['price'] + h2['price']) / 2
-                    # Swept = price has already traded above this level
-                    swept = price > level
-                    # Only relevant if level is above current price (or just swept)
-                    if level >= price * 0.995:  # within 0.5% above or already above
-                        eqh_list.append({
-                            'level': level,
-                            'swept': swept,
-                            'bar':   max(h1['i'], h2['i'])
-                        })
-
-        # Equal Lows — two swing lows within threshold
-        for i in range(len(recent_lows)):
-            for j in range(i+1, len(recent_lows)):
-                l1 = recent_lows[i]; l2 = recent_lows[j]
-                if abs(l1['price'] - l2['price']) <= threshold:
-                    level = (l1['price'] + l2['price']) / 2
-                    swept = price < level
-                    if level <= price * 1.005:  # within 0.5% below or already below
-                        eql_list.append({
-                            'level': level,
-                            'swept': swept,
-                            'bar':   max(l1['i'], l2['i'])
-                        })
-
-        # Keep only most recent unique levels
-        eqh_list.sort(key=lambda x: x['bar'], reverse=True)
-        eql_list.sort(key=lambda x: x['bar'], reverse=True)
-        return eqh_list[:3], eql_list[:3]
-
-    def classify_swing_levels(self, df, highs, lows, lookback=None):
-        """
-        Classify swing highs as Strong or Weak, and swing lows as Strong or Weak.
-        Strong High = price has since broken ABOVE it (confirmed BOS)
-        Weak High   = price has NOT yet broken above it (liquidity resting)
-        Strong Low  = price has since broken BELOW it
-        Weak Low    = price has NOT broken below it
-
-        Returns:
-          strong_highs: list of {'price', 'bar'}
-          weak_highs:   list of {'price', 'bar'}
-          strong_lows:  list of {'price', 'bar'}
-          weak_lows:    list of {'price', 'bar'}
-        """
-        if lookback is None: lookback = WEAK_LEVEL_WINDOW * 3
-        n     = len(df)
-        start = max(0, n - lookback)
-        close = df['close']
-
-        strong_highs, weak_highs   = [], []
-        strong_lows,  weak_lows    = [], []
-
-        for h in highs:
-            if h['i'] < start: continue
-            level = h['price']
-            # Check if price ever closed above this level after the swing
-            future_closes = close.iloc[h['i']+1:n]
-            if (future_closes > level).any():
-                strong_highs.append({'price': level, 'bar': h['i']})
-            else:
-                weak_highs.append({'price': level, 'bar': h['i']})
-
-        for l in lows:
-            if l['i'] < start: continue
-            level = l['price']
-            future_closes = close.iloc[l['i']+1:n]
-            if (future_closes < level).any():
-                strong_lows.append({'price': level, 'bar': l['i']})
-            else:
-                weak_lows.append({'price': level, 'bar': l['i']})
-
-        return strong_highs, weak_highs, strong_lows, weak_lows
-
-    def check_liquidity_context(self, df, direction, ob, highs, lows):
-        """
-        Master liquidity check combining EQH/EQL and Strong/Weak levels.
-        Called per signal to produce score delta + reasons + hard_block flag.
-
-        Returns: (score_delta, hard_block, reasons_list)
-        """
-        score_delta = 0
-        hard_block  = False
-        reasons     = []
-        price       = df['close'].iloc[-1]
-
-        atr = df['atr'].iloc[-1] if 'atr' in df.columns else price * 0.001
-        if pd.isna(atr) or atr == 0: atr = price * 0.001
-
-        # ── EQH/EQL Detection ─────────────────────────────────
-        eqh_list, eql_list = self.detect_equal_highs_lows(df, highs, lows)
-
-        if direction == 'LONG':
-            # EQH above OB — liquidity resting above
-            for eqh in eqh_list:
-                if eqh['level'] > ob['top']:
-                    if eqh['swept']:
-                        # Already swept — liquidity cleared = fuel for LONG
-                        score_delta += EQL_SWEPT_BONUS
-                        reasons.append(f"💧 EQH swept @ {eqh['level']:.4f} — liq cleared (+{EQL_SWEPT_BONUS}pts)")
-                    else:
-                        # Not yet swept — price likely hunts it first
-                        if EQL_UNSWEPT_BLOCK:
-                            hard_block = True
-                            reasons.append(f"🚫 Unswept EQH @ {eqh['level']:.4f} above OB — longs blocked")
-                        else:
-                            score_delta -= 8
-                            reasons.append(f"⚠️ Unswept EQH @ {eqh['level']:.4f} — liquidity magnet (-8pts)")
-                    break  # only check nearest EQH
-
-            # EQL below OB — if swept = no more stops below = clean move up
-            for eql in eql_list:
-                if eql['level'] < ob['bottom'] and eql['swept']:
-                    score_delta += EQL_SWEPT_BONUS
-                    reasons.append(f"💧 EQL swept @ {eql['level']:.4f} below OB — clean (+{EQL_SWEPT_BONUS}pts)")
-                    break
-
-        else:  # SHORT
-            # EQL below OB
-            for eql in eql_list:
-                if eql['level'] < ob['bottom']:
-                    if eql['swept']:
-                        score_delta += EQL_SWEPT_BONUS
-                        reasons.append(f"💧 EQL swept @ {eql['level']:.4f} — liq cleared (+{EQL_SWEPT_BONUS}pts)")
-                    else:
-                        if EQL_UNSWEPT_BLOCK:
-                            hard_block = True
-                            reasons.append(f"🚫 Unswept EQL @ {eql['level']:.4f} below OB — shorts blocked")
-                        else:
-                            score_delta -= 8
-                            reasons.append(f"⚠️ Unswept EQL @ {eql['level']:.4f} — liquidity magnet (-8pts)")
-                    break
-
-            # EQH above OB — if swept = clean drop
-            for eqh in eqh_list:
-                if eqh['level'] > ob['top'] and eqh['swept']:
-                    score_delta += EQL_SWEPT_BONUS
-                    reasons.append(f"💧 EQH swept @ {eqh['level']:.4f} above OB — clean (+{EQL_SWEPT_BONUS}pts)")
-                    break
-
-        # ── Strong / Weak Level Check ──────────────────────────
-        strong_highs, weak_highs, strong_lows, weak_lows = \
-            self.classify_swing_levels(df, highs, lows)
-
-        if direction == 'LONG':
-            # Weak high directly above OB = danger (liquidity target)
-            for wh in weak_highs:
-                if ob['top'] < wh['price'] < ob['top'] * (1 + WEAK_LEVEL_WINDOW * 0.002):
-                    score_delta -= WEAK_LEVEL_PENALTY
-                    reasons.append(f"⚠️ Weak High @ {wh['price']:.4f} above OB — stop hunt risk (-{WEAK_LEVEL_PENALTY}pts)")
-                    break
-
-            # Strong low below entry = solid support floor
-            for sl in strong_lows:
-                if sl['price'] < ob['bottom']:
-                    score_delta += STRONG_LEVEL_BONUS
-                    reasons.append(f"🏔️ Strong Low @ {sl['price']:.4f} below OB — structure support (+{STRONG_LEVEL_BONUS}pts)")
-                    break
-
-        else:  # SHORT
-            # Weak low directly below OB = danger
-            for wl in weak_lows:
-                if ob['bottom'] * (1 - WEAK_LEVEL_WINDOW * 0.002) < wl['price'] < ob['bottom']:
-                    score_delta -= WEAK_LEVEL_PENALTY
-                    reasons.append(f"⚠️ Weak Low @ {wl['price']:.4f} below OB — stop hunt risk (-{WEAK_LEVEL_PENALTY}pts)")
-                    break
-
-            # Strong high above entry = solid resistance ceiling
-            for sh in strong_highs:
-                if sh['price'] > ob['top']:
-                    score_delta += STRONG_LEVEL_BONUS
-                    reasons.append(f"🏔️ Strong High @ {sh['price']:.4f} above OB — structure resistance (+{STRONG_LEVEL_BONUS}pts)")
-                    break
-
-        return score_delta, hard_block, reasons
-
-    def detect_trigger_candle(self, df, direction):
-        """Check last 2 candles for trigger patterns. Returns (label, strength)"""
-        l1 = df.iloc[-1]
-        p1 = df.iloc[-2]
-        if direction == 'LONG':
-            if l1.get('bull_engulf', 0) == 1: return "Bullish Engulfing", 3
-            if l1.get('bull_pin',   0) == 1:  return "Bullish Pin Bar",   2
-            if l1.get('hammer',     0) == 1:  return "Hammer",            2
-            if p1.get('bull_engulf',0) == 1:  return "Bull Engulf (prev)",1
-            if p1.get('bull_pin',   0) == 1:  return "Bull Pin (prev)",   1
-            if p1.get('hammer',     0) == 1:  return "Hammer (prev)",     1
-        else:
-            if l1.get('bear_engulf',  0) == 1: return "Bearish Engulfing", 3
-            if l1.get('bear_pin',     0) == 1: return "Bearish Pin Bar",   2
-            if l1.get('shooting_star',0) == 1: return "Shooting Star",     2
-            if p1.get('bear_engulf',  0) == 1: return "Bear Engulf (prev)",1
-            if p1.get('bear_pin',     0) == 1: return "Bear Pin (prev)",   1
-            if p1.get('shooting_star',0) == 1: return "Shooting Star (prev)",1
-        return None, 0
-
-
-# ══════════════════════════════════════════════════════════════════
-#  BTC FULL SMC ANALYSER  ← THE CORE UPGRADE IN v4.3
-# ══════════════════════════════════════════════════════════════════
-
-class BTCAnalyser:
-    """
-    Runs the full SMC stack on BTC across 4H, 1H, 15M.
-    Produces a BTCContext dict consumed by the main scanner.
-    """
-
-    def __init__(self, smc: SMCEngine):
-        self.smc = smc
-
-    def _ema_trend(self, row) -> str:
-        e21, e50, e200 = row.get('ema_21',0), row.get('ema_50',0), row.get('ema_200',0)
-        if e21 > e50 > e200: return 'STRONG_BULL'
-        if e21 > e50:        return 'BULL'
-        if e21 < e50 < e200: return 'STRONG_BEAR'
-        if e21 < e50:        return 'BEAR'
-        return 'RANGING'
-
-    def _determine_regime(self, ema_trend, structure, trigger_label) -> str:
-        """
-        Combine 4H EMA trend, 1H structure break, and 1H trigger candle
-        into a single BTC regime label.
-        """
-        has_bull_structure = structure and 'BULL' in structure['kind']
-        has_bear_structure = structure and 'BEAR' in structure['kind']
-        is_mss_bull        = structure and 'MSS_BULL' in structure['kind']
-        is_mss_bear        = structure and 'MSS_BEAR' in structure['kind']
-        has_bull_trigger   = trigger_label is not None and 'Bull' in (trigger_label or '') or 'Hammer' in (trigger_label or '') or 'Engulfing' in (trigger_label or '') and 'Bear' not in (trigger_label or '')
-        has_bear_trigger   = trigger_label is not None and ('Bear' in (trigger_label or '') or 'Shooting' in (trigger_label or ''))
-
-        bull_4h = ema_trend in ('BULL', 'STRONG_BULL')
-        bear_4h = ema_trend in ('BEAR', 'STRONG_BEAR')
-
-        # Full confirmation — trend + structure + trigger all agree
-        if bull_4h and has_bull_structure and has_bull_trigger:
-            return 'BULL_CONFIRMED'
-        if bear_4h and has_bear_structure and has_bear_trigger:
-            return 'BEAR_CONFIRMED'
-
-        # Structure matches trend but no trigger candle yet
-        if bull_4h and has_bull_structure:
-            return 'BULL_STRUCTURE'
-        if bear_4h and has_bear_structure:
-            return 'BEAR_STRUCTURE'
-
-        # MSS against trend — early reversal signal
-        if bull_4h and is_mss_bear:
-            return 'REVERSAL_BEAR'
-        if bear_4h and is_mss_bull:
-            return 'REVERSAL_BULL'
-
-        # Trend exists but no structure break yet
-        if bull_4h:
-            return 'BULL_RANGING'
-        if bear_4h:
-            return 'BEAR_RANGING'
-
-        return 'RANGING'
-
-    def analyse(self, df_4h, df_1h, df_15m) -> dict:
-        """
-        Full BTC SMC analysis. Returns a rich context dictionary.
-        """
-        ctx = {
-            'regime':        'RANGING',
-            'ema_trend':     'RANGING',
-            'price':          0,
-            '1h_chg':         0.0,
-            '3h_chg':         0.0,
-            'hh_ll':          False,
-            'hh_ll_msg':      '',
-            'pd_zone':        'NEUTRAL',
-            'pd_pos':          0.5,
-            'structure':      None,
-            'ob_bull':        None,   # nearest bullish OB
-            'ob_bear':        None,   # nearest bearish OB
-            'at_bull_ob':     False,
-            'at_bear_ob':     False,
-            'sweep':          None,
-            'fvg_bull':       None,
-            'fvg_bear':       None,
-            'trigger_label':  None,
-            'trigger_strength': 0,
-            'vol_ratio_15m':  1.0,
-            'rsi':            50.0,
-            'macd_bull':      False,
-        }
-
-        try:
-            if len(df_1h) < 80 or len(df_4h) < 60:
-                return ctx
-
-            price = df_1h['close'].iloc[-1]
-            ctx['price'] = price
-
-            # ── 4H EMA trend ─────────────────────────────────────
-            l4 = df_4h.iloc[-1]
-            ema_trend = self._ema_trend(l4)
-            ctx['ema_trend'] = ema_trend
-
-            # ── 4H HH/LL ─────────────────────────────────────────
-            # Check both directions, pick whichever matches trend
-            bias_for_hhll = 'LONG' if 'BULL' in ema_trend else 'SHORT'
-            hh_ll_ok, hh_ll_msg = self.smc.check_4h_hh_ll(df_4h, bias_for_hhll, HH_LL_LOOKBACK)
-            ctx['hh_ll']     = hh_ll_ok
-            ctx['hh_ll_msg'] = hh_ll_msg
-
-            # ── 4H PD Zone ────────────────────────────────────────
-            pd_label, pd_pos = self.smc.pd_zone(df_4h, price)
-            ctx['pd_zone'] = pd_label
-            ctx['pd_pos']  = pd_pos
-
-            # ── 1H Structure ──────────────────────────────────────
-            highs1, lows1 = self.smc.swing_highs_lows(df_1h, left=4, right=4)
-            structure     = self.smc.detect_structure_break(
-                df_1h, highs1, lows1, lookback=STRUCTURE_LOOKBACK
-            )
-            ctx['structure'] = structure
-
-            # ── 1H Order Blocks (both directions) ─────────────────
-            obs_bull = self.smc.find_order_blocks(df_1h, 'LONG',  lookback=60)
-            obs_bear = self.smc.find_order_blocks(df_1h, 'SHORT', lookback=60)
-
-            ctx['ob_bull'] = obs_bull[0] if obs_bull else None
-            ctx['ob_bear'] = obs_bear[0] if obs_bear else None
-
-            ctx['at_bull_ob'] = any(
-                self.smc.price_in_ob(price, ob) for ob in obs_bull
-            )
-            ctx['at_bear_ob'] = any(
-                self.smc.price_in_ob(price, ob) for ob in obs_bear
-            )
-
-            # ── 1H Liquidity Sweep ────────────────────────────────
-            # Check if BTC just swept lows (bullish) or highs (bearish)
-            sweep_bull = self.smc.recent_liquidity_sweep(df_1h, 'LONG',  highs1, lows1, lookback=20)
-            sweep_bear = self.smc.recent_liquidity_sweep(df_1h, 'SHORT', highs1, lows1, lookback=20)
-            ctx['sweep'] = sweep_bull or sweep_bear
-
-            # ── 1H FVG (both directions) ──────────────────────────
-            fvg_bull_list = self.smc.find_fvg(df_1h, 'LONG',  lookback=25)
-            fvg_bear_list = self.smc.find_fvg(df_1h, 'SHORT', lookback=25)
-            ctx['fvg_bull'] = fvg_bull_list[0] if fvg_bull_list else None
-            ctx['fvg_bear'] = fvg_bear_list[0] if fvg_bear_list else None
-
-            # ── 1H Trigger Candle ─────────────────────────────────
-            # Determine trigger in direction of structure
-            if structure and 'BULL' in structure['kind']:
-                trig_dir = 'LONG'
-            elif structure and 'BEAR' in structure['kind']:
-                trig_dir = 'SHORT'
-            else:
-                trig_dir = 'LONG' if 'BULL' in ema_trend else 'SHORT'
-
-            t_label, t_strength = self.smc.detect_trigger_candle(df_1h, trig_dir)
-            ctx['trigger_label']    = t_label
-            ctx['trigger_strength'] = t_strength
-
-            # ── 1H Momentum ───────────────────────────────────────
-            l1 = df_1h.iloc[-1]
-            ctx['rsi']       = l1.get('rsi', 50)
-            ctx['macd_bull'] = l1.get('macd', 0) > l1.get('macd_signal', 0)
-            ctx['1h_chg']    = (df_1h['close'].iloc[-1] - df_1h['open'].iloc[-1]) / df_1h['open'].iloc[-1] * 100
-            ctx['3h_chg']    = (df_1h['close'].iloc[-1] - df_1h['open'].iloc[-3]) / df_1h['open'].iloc[-3] * 100
-
-            # ── 15M Volume ────────────────────────────────────────
-            if len(df_15m) > 20:
-                ctx['vol_ratio_15m'] = df_15m['vol_ratio'].iloc[-1] if 'vol_ratio' in df_15m.columns else 1.0
-
-            # ── Regime Label ──────────────────────────────────────
-            ctx['regime'] = self._determine_regime(ema_trend, structure, t_label)
-
-        except Exception as e:
-            logger.error(f"BTC analyser error: {e}")
-
-        return ctx
-
-
-# ══════════════════════════════════════════════════════════════════
-#  BTC ALIGNMENT CHECKER  (uses full BTCContext)
-# ══════════════════════════════════════════════════════════════════
-
-def check_btc_alignment(btc_ctx: dict, direction: str):
-    """
-    Evaluate the BTC regime against the proposed alt trade direction.
-
-    Returns:
-        score_delta (int)  — points to add/subtract from signal score
-        hard_block (bool)  — True = skip this signal entirely
-        label (str)        — human-readable reason
-        reasons (list)     — detailed breakdown lines
-    """
-    if not btc_ctx:
-        return 0, False, "⚪ BTC data unavailable — filter skipped", []
-
-    regime   = btc_ctx['regime']
-    chg_1h   = btc_ctx['1h_chg']
-    chg_3h   = btc_ctx['3h_chg']
-    sweep    = btc_ctx['sweep']
-    at_bull  = btc_ctx['at_bull_ob']
-    at_bear  = btc_ctx['at_bear_ob']
-    fvg_bull = btc_ctx['fvg_bull']
-    fvg_bear = btc_ctx['fvg_bear']
-    vol15    = btc_ctx['vol_ratio_15m']
-
-    reasons = []
-
-    # ── Hard Blocks ───────────────────────────────────────────────
-
-    # Flash move block
-    if direction == 'LONG' and chg_1h < -BTC_HARD_BLOCK_1H_PCT:
-        return -999, True, f"🚫 BTC flash dump {chg_1h:.1f}% (1H) — LONGs blocked", []
-
-    if direction == 'SHORT' and chg_1h > BTC_HARD_BLOCK_1H_PCT:
-        return -999, True, f"🚫 BTC flash pump +{chg_1h:.1f}% (1H) — SHORTs blocked", []
-
-    # Regime-based hard blocks
-    if direction == 'LONG' and regime == 'BEAR_CONFIRMED':
-        if at_bear:
-            return -999, True, "🚫 BTC BEAR_CONFIRMED + price at bear OB — LONGs blocked", []
-        if chg_3h < -BTC_HARD_BLOCK_3H_PCT:
-            return -999, True, f"🚫 BTC BEAR_CONFIRMED + {chg_3h:.1f}% (3H) — LONGs blocked", []
-
-    if direction == 'SHORT' and regime == 'BULL_CONFIRMED':
-        if at_bull:
-            return -999, True, "🚫 BTC BULL_CONFIRMED + price at bull OB — SHORTs blocked", []
-        if chg_3h > BTC_HARD_BLOCK_3H_PCT:
-            return -999, True, f"🚫 BTC BULL_CONFIRMED + +{chg_3h:.1f}% (3H) — SHORTs blocked", []
-
-    # Reversal warning blocks
-    if direction == 'LONG' and regime == 'REVERSAL_BEAR':
-        return -999, True, "🚫 BTC REVERSAL_BEAR forming (MSS against bull trend) — LONGs blocked", []
-
-    if direction == 'SHORT' and regime == 'REVERSAL_BULL':
-        return -999, True, "🚫 BTC REVERSAL_BULL forming (MSS against bear trend) — SHORTs blocked", []
-
-    # ── Score Modifier from Regime ────────────────────────────────
-    scores = BTC_REGIME_SCORES.get(regime, (0, 0))
-    delta  = scores[0] if direction == 'LONG' else scores[1]
-
-    regime_icons = {
-        'BULL_CONFIRMED': '🟢🟢', 'BULL_STRUCTURE': '🟢',  'BULL_RANGING': '🟢',
-        'BEAR_CONFIRMED': '🔴🔴', 'BEAR_STRUCTURE': '🔴',  'BEAR_RANGING': '🔴',
-        'REVERSAL_BULL':  '🔄🟢', 'REVERSAL_BEAR':  '🔄🔴','RANGING': '🟡',
-    }
-    icon = regime_icons.get(regime, '⚪')
-    sign = f"+{delta}" if delta >= 0 else str(delta)
-    reasons.append(f"{icon} BTC regime: {regime} → {sign}pts")
-
-    # ── Bonus: BTC at its own OB ──────────────────────────────────
-    if direction == 'LONG' and at_bull:
-        delta += BTC_OB_BONUS
-        reasons.append(f"🎯 BTC at bullish OB support (+{BTC_OB_BONUS}pts)")
-    elif direction == 'SHORT' and at_bear:
-        delta += BTC_OB_BONUS
-        reasons.append(f"🎯 BTC at bearish OB resistance (+{BTC_OB_BONUS}pts)")
-
-    # ── Bonus: BTC liquidity sweep ────────────────────────────────
-    if sweep:
-        sweep_type = sweep.get('type','')
-        if direction == 'LONG' and sweep_type == 'SWEEP_LOW':
-            delta += BTC_SWEEP_BONUS
-            reasons.append(f"💧 BTC swept lows @ {sweep['level']:.0f} — stops cleared (+{BTC_SWEEP_BONUS}pts)")
-        elif direction == 'SHORT' and sweep_type == 'SWEEP_HIGH':
-            delta += BTC_SWEEP_BONUS
-            reasons.append(f"💧 BTC swept highs @ {sweep['level']:.0f} — stops cleared (+{BTC_SWEEP_BONUS}pts)")
-
-    # ── Bonus: BTC FVG in signal direction ────────────────────────
-    if direction == 'LONG' and fvg_bull:
-        delta += BTC_FVG_BONUS
-        reasons.append(f"⚡ BTC bull FVG [{fvg_bull['bottom']:.0f}–{fvg_bull['top']:.0f}] (+{BTC_FVG_BONUS}pts)")
-    elif direction == 'SHORT' and fvg_bear:
-        delta += BTC_FVG_BONUS
-        reasons.append(f"⚡ BTC bear FVG [{fvg_bear['bottom']:.0f}–{fvg_bear['top']:.0f}] (+{BTC_FVG_BONUS}pts)")
-
-    # ── Bonus: BTC 15M volume spike ───────────────────────────────
-    if vol15 >= 2.0:
-        delta += BTC_VOL_BONUS
-        reasons.append(f"🚀 BTC 15M vol spike {vol15:.1f}x (+{BTC_VOL_BONUS}pts)")
-
-    summary_label = f"🟠 BTC {regime} | {chg_1h:+.2f}% (1H) | {chg_3h:+.2f}% (3H) → {sign}pts"
-    return delta, False, summary_label, reasons
-
-
-def regime_emoji(regime: str) -> str:
-    return {
-        'BULL_CONFIRMED': '🟢🟢', 'BULL_STRUCTURE': '🟢',  'BULL_RANGING':  '🟡🟢',
-        'BEAR_CONFIRMED': '🔴🔴', 'BEAR_STRUCTURE': '🔴',  'BEAR_RANGING':  '🟡🔴',
-        'REVERSAL_BULL':  '🔄🟢', 'REVERSAL_BEAR':  '🔄🔴','RANGING':       '🟡',
-    }.get(regime, '⚪')
-
-
-# ══════════════════════════════════════════════════════════════════
-#  SCORER
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+#  SCORER  (1H-based trigger, 15M volume bonus only)
+# ══════════════════════════════════════════════════════════════
 
 def score_setup(direction, ob, structure, sweep, fvg_near,
-                df_1h, df_15m, df_4h, pd_label, hh_ll_confirmed,
-                btc_delta=0, btc_reasons=None,
-                liq_delta=0, liq_reasons=None):
-    score   = 0
+                df_1h, df_15m, df_4h, pd_label, hh_ll_confirmed):
+    score = 0
     reasons = []
-    failed  = []
+    failed = []
 
-    l1  = df_1h.iloc[-1]
-    p1  = df_1h.iloc[-2]
-    l15 = df_15m.iloc[-1]
+    l1  = df_1h.iloc[-1]   # current 1H candle  ← ENTRY TRIGGER SOURCE
+    p1  = df_1h.iloc[-2]   # previous 1H candle
+    l15 = df_15m.iloc[-1]  # used for vol bonus only
     l4  = df_4h.iloc[-1]
 
-    # ── 1. Structure (20 pts) ─────────────────────────────────────
+    # ── 1. Structure (20 pts) ─────────────────────────────────
     if structure:
         if 'MSS' in structure['kind']:
             score += 20; reasons.append(f"🏗️ MSS — Early Reversal ({structure['kind']})")
@@ -1002,7 +314,7 @@ def score_setup(direction, ob, structure, sweep, fvg_near,
     else:
         failed.append("❌ No BOS/MSS in last 20 candles")
 
-    # ── 2. Order Block quality (20 pts) ──────────────────────────
+    # ── 2. Order Block quality (20 pts) ──────────────────────
     if ob:
         ob_size_pct = (ob['top'] - ob['bottom']) / ob['bottom'] * 100
         if ob_size_pct < 0.8:
@@ -1014,10 +326,8 @@ def score_setup(direction, ob, structure, sweep, fvg_near,
     else:
         failed.append("❌ No valid OB found")
 
-    # ── 3. 4H Trend Alignment (15 pts) ───────────────────────────
-    e21  = l4.get('ema_21', 0)
-    e50  = l4.get('ema_50', 0)
-    e200 = l4.get('ema_200', 0)
+    # ── 3. 4H Trend Alignment (15 pts) ───────────────────────
+    e21 = l4.get('ema_21', 0); e50 = l4.get('ema_50', 0); e200 = l4.get('ema_200', 0)
     if direction == 'LONG':
         if e21 > e50 > e200:
             score += 15; reasons.append("📈 4H Triple EMA Bull Stack")
@@ -1037,93 +347,123 @@ def score_setup(direction, ob, structure, sweep, fvg_near,
         else:
             failed.append("⚠️ 4H trend weak for SHORT")
 
-    # ── 4. 4H HH/LL Bonus (8 pts) ────────────────────────────────
+    # ── 4. 4H HH/LL Bonus (8 pts) ────────────────────────────
     if hh_ll_confirmed:
         score += HH_LL_BONUS
         reasons.append(f"🏔️ 4H HH/LL confirmed (+{HH_LL_BONUS}pts)")
     else:
-        failed.append("➖ 4H HH/LL not confirmed — ranging")
+        failed.append(f"➖ 4H HH/LL not confirmed — ranging")
 
-    # ── 5. 1H Entry Trigger (25 pts) ─────────────────────────────
+    # ── 5. 1H Entry Trigger (25 pts) ← UPGRADED FROM 15M ─────
+    # Now reading from 1H candles — much stronger signal weight
     trigger = False
     trigger_label = ""
+
     if direction == 'LONG':
-        if l1.get('bull_engulf',  0) == 1: score += 25; trigger=True; trigger_label="🕯️ 1H Bull Engulfing ✅"
-        elif l1.get('bull_pin',   0) == 1: score += 22; trigger=True; trigger_label="🕯️ 1H Bull Pin Bar ✅"
-        elif l1.get('hammer',     0) == 1: score += 18; trigger=True; trigger_label="🕯️ 1H Hammer ✅"
-        elif p1.get('bull_engulf',0) == 1: score += 14; trigger=True; trigger_label="🕯️ 1H Bull Engulf (prev) ✅"
-        elif p1.get('bull_pin',   0) == 1: score += 11; trigger=True; trigger_label="🕯️ 1H Bull Pin (prev) ✅"
-        elif p1.get('hammer',     0) == 1: score +=  9; trigger=True; trigger_label="🕯️ 1H Hammer (prev) ✅"
+        if l1.get('bull_engulf', 0) == 1:
+            score += 25; trigger = True
+            trigger_label = "🕯️ 1H Bullish Engulfing ✅ (strongest)"
+        elif l1.get('bull_pin', 0) == 1:
+            score += 22; trigger = True
+            trigger_label = "🕯️ 1H Bullish Pin Bar ✅"
+        elif l1.get('hammer', 0) == 1:
+            score += 18; trigger = True
+            trigger_label = "🕯️ 1H Hammer ✅"
+        elif p1.get('bull_engulf', 0) == 1:
+            score += 14; trigger = True
+            trigger_label = "🕯️ 1H Bull Engulf (prev candle) ✅"
+        elif p1.get('bull_pin', 0) == 1:
+            score += 11; trigger = True
+            trigger_label = "🕯️ 1H Bull Pin (prev candle) ✅"
+        elif p1.get('hammer', 0) == 1:
+            score += 9;  trigger = True
+            trigger_label = "🕯️ 1H Hammer (prev candle) ✅"
     else:
-        if l1.get('bear_engulf',   0) == 1: score += 25; trigger=True; trigger_label="🕯️ 1H Bear Engulfing ✅"
-        elif l1.get('bear_pin',    0) == 1: score += 22; trigger=True; trigger_label="🕯️ 1H Bear Pin Bar ✅"
-        elif l1.get('shooting_star',0)== 1: score += 18; trigger=True; trigger_label="🕯️ 1H Shooting Star ✅"
-        elif p1.get('bear_engulf', 0) == 1: score += 14; trigger=True; trigger_label="🕯️ 1H Bear Engulf (prev) ✅"
-        elif p1.get('bear_pin',    0) == 1: score += 11; trigger=True; trigger_label="🕯️ 1H Bear Pin (prev) ✅"
-        elif p1.get('shooting_star',0)== 1: score +=  9; trigger=True; trigger_label="🕯️ 1H Shooting Star (prev) ✅"
+        if l1.get('bear_engulf', 0) == 1:
+            score += 25; trigger = True
+            trigger_label = "🕯️ 1H Bearish Engulfing ✅ (strongest)"
+        elif l1.get('bear_pin', 0) == 1:
+            score += 22; trigger = True
+            trigger_label = "🕯️ 1H Bearish Pin Bar ✅"
+        elif l1.get('shooting_star', 0) == 1:
+            score += 18; trigger = True
+            trigger_label = "🕯️ 1H Shooting Star ✅"
+        elif p1.get('bear_engulf', 0) == 1:
+            score += 14; trigger = True
+            trigger_label = "🕯️ 1H Bear Engulf (prev candle) ✅"
+        elif p1.get('bear_pin', 0) == 1:
+            score += 11; trigger = True
+            trigger_label = "🕯️ 1H Bear Pin (prev candle) ✅"
+        elif p1.get('shooting_star', 0) == 1:
+            score += 9;  trigger = True
+            trigger_label = "🕯️ 1H Shooting Star (prev candle) ✅"
 
     if trigger:
         reasons.append(trigger_label)
     else:
-        score -= 12
-        failed.append("⏳ No 1H trigger yet — setup forming")
+        score -= 12  # harder penalty now — 1H trigger is the backbone
+        failed.append("⏳ No 1H trigger candle yet — setup forming, wait for close")
 
-    # ── 6. Momentum (12 pts) ──────────────────────────────────────
+    # ── 6. Momentum (12 pts) ─────────────────────────────────
     rsi1  = l1.get('rsi', 50)
     macd1 = l1.get('macd', 0);  ms1  = l1.get('macd_signal', 0)
     pm1   = p1.get('macd', 0);  pms1 = p1.get('macd_signal', 0)
     sk1   = l1.get('srsi_k', 0.5); sd1 = l1.get('srsi_d', 0.5)
 
     if direction == 'LONG':
-        if 28 <= rsi1 <= 55:   score += 4; reasons.append(f"✅ RSI reset ({rsi1:.0f})")
-        elif rsi1 < 28:        score += 3; reasons.append(f"✅ RSI oversold ({rsi1:.0f})")
-        if macd1>ms1 and pm1<=pms1: score+=5; reasons.append("⚡ MACD bull cross")
-        elif macd1 > ms1:      score += 2; reasons.append("✅ MACD bullish")
-        if sk1 < 0.3 and sk1 > sd1: score+=3; reasons.append("⚡ StochRSI bull cross")
+        if 28 <= rsi1 <= 55:
+            score += 4; reasons.append(f"✅ RSI reset zone ({rsi1:.0f})")
+        elif rsi1 < 28:
+            score += 3; reasons.append(f"✅ RSI oversold ({rsi1:.0f})")
+        if macd1 > ms1 and pm1 <= pms1:
+            score += 5; reasons.append("⚡ MACD bull cross")
+        elif macd1 > ms1:
+            score += 2; reasons.append("✅ MACD bullish")
+        if sk1 < 0.3 and sk1 > sd1:
+            score += 3; reasons.append("⚡ Stoch RSI bull cross")
     else:
-        if 45 <= rsi1 <= 72:   score += 4; reasons.append(f"✅ RSI OB zone ({rsi1:.0f})")
-        elif rsi1 > 72:        score += 3; reasons.append(f"✅ RSI overbought ({rsi1:.0f})")
-        if macd1<ms1 and pm1>=pms1: score+=5; reasons.append("⚡ MACD bear cross")
-        elif macd1 < ms1:      score += 2; reasons.append("✅ MACD bearish")
-        if sk1 > 0.7 and sk1 < sd1: score+=3; reasons.append("⚡ StochRSI bear cross")
+        if 45 <= rsi1 <= 72:
+            score += 4; reasons.append(f"✅ RSI overbought zone ({rsi1:.0f})")
+        elif rsi1 > 72:
+            score += 3; reasons.append(f"✅ RSI overbought ({rsi1:.0f})")
+        if macd1 < ms1 and pm1 >= pms1:
+            score += 5; reasons.append("⚡ MACD bear cross")
+        elif macd1 < ms1:
+            score += 2; reasons.append("✅ MACD bearish")
+        if sk1 > 0.7 and sk1 < sd1:
+            score += 3; reasons.append("⚡ Stoch RSI bear cross")
 
-    # ── 7. Extras: Sweep / FVG / 15M Vol / VWAP (10 pts) ─────────
+    # ── 7. Extras: Sweep / FVG / 15M Vol spike (10 pts) ──────
     extras = 0
-    if sweep:    extras += 4; reasons.append(f"💧 ALT liq sweep @ {sweep['level']:.5f}")
-    if fvg_near: extras += 3; reasons.append("⚡ FVG overlaps OB")
+    if sweep:
+        extras += 4; reasons.append(f"💧 Liq. sweep @ {sweep['level']:.5f}")
+    if fvg_near:
+        extras += 3; reasons.append("⚡ FVG overlaps OB")
 
+    # 15M volume — only bonus use of 15M now
     vr15 = l15.get('vol_ratio', 1.0)
-    if   vr15 >= 2.5: extras += 3; reasons.append(f"🚀 15M vol spike {vr15:.1f}x")
-    elif vr15 >= 1.5: extras += 1; reasons.append(f"✅ 15M elevated vol {vr15:.1f}x")
+    if   vr15 >= 2.5:
+        extras += 3; reasons.append(f"🚀 15M vol spike {vr15:.1f}x")
+    elif vr15 >= 1.5:
+        extras += 1; reasons.append(f"✅ 15M elevated vol {vr15:.1f}x")
 
+    # 1H VWAP confirmation
     close1 = l1.get('close', 0); vwap1 = l1.get('vwap', 0)
-    if direction == 'LONG'  and close1 < vwap1: extras = min(extras+1, 10); reasons.append("✅ Below VWAP")
-    elif direction == 'SHORT' and close1 > vwap1: extras = min(extras+1, 10); reasons.append("✅ Above VWAP")
+    if direction == 'LONG' and close1 < vwap1:
+        extras = min(extras+1, 10); reasons.append("✅ 1H below VWAP")
+    elif direction == 'SHORT' and close1 > vwap1:
+        extras = min(extras+1, 10); reasons.append("✅ 1H above VWAP")
 
     score += min(extras, 10)
-
-    # ── 8. BTC Full SMC Context (up to ±18 pts) ──────────────────
-    if btc_delta != 0 or btc_reasons:
-        score += btc_delta
-        if btc_reasons:
-            reasons.extend([f"  ↳ {r}" for r in btc_reasons])
-
-    # ── 9. Liquidity Awareness: EQH/EQL + Strong/Weak (v4.3) ─────
-    if liq_delta != 0 or liq_reasons:
-        score += liq_delta
-        if liq_reasons:
-            for r in liq_reasons:
-                reasons.append(r)
 
     return max(0, min(int(score), 100)), reasons, failed
 
 
-# ══════════════════════════════════════════════════════════════════
-#  MAIN SCANNER BOT
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+#  MAIN BOT
+# ══════════════════════════════════════════════════════════════
 
 class SMCProScanner:
-
     def __init__(self, telegram_token, chat_id, api_key=None, secret=None):
         self.token    = telegram_token
         self.bot      = Bot(token=telegram_token)
@@ -1133,54 +473,17 @@ class SMCProScanner:
             'enableRateLimit': True,
             'options': {'defaultType': 'future'}
         })
-        self.smc          = SMCEngine()
-        self.btc_analyser = BTCAnalyser(self.smc)
-
+        self.smc            = SMCEngine()
         self.active_trades  = {}
         self.signal_history = deque(maxlen=300)
         self.is_scanning    = False
         self.last_debug     = []
-        self.last_btc_ctx   = None
-
         self.stats = {
             'total': 0, 'long': 0, 'short': 0,
             'elite': 0, 'premium': 0, 'high': 0,
             'tp1': 0, 'tp2': 0, 'tp3': 0, 'sl': 0,
-            'btc_blocks': 0,
-            'last_scan': None, 'pairs_scanned': 0,
+            'last_scan': None, 'pairs_scanned': 0
         }
-
-    # ── BTC Data Fetcher ─────────────────────────────────────────
-
-    async def fetch_btc_context(self) -> dict:
-        """Fetch BTC OHLCV across 3 TFs and run full SMC analysis."""
-        try:
-            raw_4h  = await self.exchange.fetch_ohlcv('BTC/USDT:USDT', '4h',  limit=220)
-            raw_1h  = await self.exchange.fetch_ohlcv('BTC/USDT:USDT', '1h',  limit=150)
-            raw_15m = await self.exchange.fetch_ohlcv('BTC/USDT:USDT', '15m', limit=80)
-
-            dfs = {}
-            for key, raw in [('4h', raw_4h), ('1h', raw_1h), ('15m', raw_15m)]:
-                df = pd.DataFrame(raw, columns=['ts','open','high','low','close','volume'])
-                df['ts'] = pd.to_datetime(df['ts'], unit='ms')
-                dfs[key] = add_indicators(df)
-
-            ctx = self.btc_analyser.analyse(dfs['4h'], dfs['1h'], dfs['15m'])
-            self.last_btc_ctx = ctx
-
-            logger.info(
-                f"🟠 BTC: {ctx['regime']} | ${ctx['price']:,.0f} | "
-                f"1H: {ctx['1h_chg']:+.2f}% | 3H: {ctx['3h_chg']:+.2f}% | "
-                f"Structure: {ctx['structure']['kind'] if ctx['structure'] else 'None'} | "
-                f"At OB: bull={ctx['at_bull_ob']} bear={ctx['at_bear_ob']}"
-            )
-            return ctx
-
-        except Exception as e:
-            logger.error(f"BTC context error: {e}")
-            return None
-
-    # ── Alt Data Fetcher ─────────────────────────────────────────
 
     async def get_pairs(self):
         try:
@@ -1202,6 +505,8 @@ class SMCProScanner:
         try:
             result = {}
             for tf, lim in [('4h', 220), ('1h', 150), ('15m', 80)]:
+                # 1H gets more candles now (it's doing more work)
+                # 15M only needs recent candles for vol check
                 raw = await self.exchange.fetch_ohlcv(symbol, tf, limit=lim)
                 df  = pd.DataFrame(raw, columns=['ts','open','high','low','close','volume'])
                 df['ts'] = pd.to_datetime(df['ts'], unit='ms')
@@ -1211,13 +516,8 @@ class SMCProScanner:
         except Exception as e:
             logger.error(f"Fetch {symbol}: {e}"); return None
 
-    # ── Analysis ──────────────────────────────────────────────────
-
-    def analyse(self, data, symbol, btc_ctx=None):
-        debug = {
-            'symbol': symbol.replace('/USDT:USDT',''),
-            'gates': [], 'score': 0, 'bias': '?'
-        }
+    def analyse(self, data, symbol):
+        debug = {'symbol': symbol.replace('/USDT:USDT',''), 'gates': [], 'score': 0, 'bias': '?'}
 
         try:
             df4 = data['4h']; df1 = data['1h']; df15 = data['15m']
@@ -1225,59 +525,54 @@ class SMCProScanner:
                 debug['gates'].append('❌ Not enough candle data')
                 return None, debug
 
-            price = df1['close'].iloc[-1]
+            price = df1['close'].iloc[-1]   # price from 1H now (more stable)
 
             # Gate 1: 4H Bias
             l4 = df4.iloc[-1]
-            e21 = l4.get('ema_21',0); e50 = l4.get('ema_50',0)
-            if   e21 > e50: bias = 'LONG'
-            elif e21 < e50: bias = 'SHORT'
+            e21 = l4.get('ema_21', 0); e50 = l4.get('ema_50', 0)
+            if e21 > e50:       bias = 'LONG'
+            elif e21 < e50:     bias = 'SHORT'
             else:
                 debug['gates'].append('❌ 4H EMAs flat — no bias')
                 return None, debug
             debug['bias'] = bias
 
-            # ── BTC Full SMC Gate (early) ← UPGRADED ─────────────
-            btc_delta, btc_block, btc_summary, btc_reasons = check_btc_alignment(btc_ctx, bias)
-            debug['gates'].append(f"🟠 {btc_summary}")
-            if btc_block:
-                self.stats['btc_blocks'] += 1
-                debug['gates'].append(f'🚫 BTC hard block — {bias} skipped')
-                return None, debug
-            # ─────────────────────────────────────────────────────
-
-            # HH/LL bonus
+            # HH/LL bonus check (not a gate)
             hh_ll_ok, hh_ll_msg = self.smc.check_4h_hh_ll(df4, bias, HH_LL_LOOKBACK)
             debug['gates'].append(hh_ll_msg)
 
             # Gate 2: PD Zone
             pd_label, pd_pos = self.smc.pd_zone(df4, price)
             if bias == 'LONG' and pd_label == 'PREMIUM':
-                debug['gates'].append(f'❌ PREMIUM zone — no longs'); return None, debug
+                debug['gates'].append(f'❌ PD zone: PREMIUM ({pd_pos*100:.0f}%) — no longs here')
+                return None, debug
             if bias == 'SHORT' and pd_label == 'DISCOUNT':
-                debug['gates'].append(f'❌ DISCOUNT zone — no shorts'); return None, debug
+                debug['gates'].append(f'❌ PD zone: DISCOUNT ({pd_pos*100:.0f}%) — no shorts here')
+                return None, debug
             debug['gates'].append(f'✅ PD zone: {pd_label} ({pd_pos*100:.0f}%)')
 
             # Gate 3: 1H Structure
             highs1, lows1 = self.smc.swing_highs_lows(df1, left=4, right=4)
-            structure = self.smc.detect_structure_break(df1, highs1, lows1, STRUCTURE_LOOKBACK)
+            structure = self.smc.detect_structure_break(df1, highs1, lows1, lookback=STRUCTURE_LOOKBACK)
             if structure:
-                if bias == 'LONG' and 'BEAR' in structure['kind']:
-                    debug['gates'].append(f'❌ Structure {structure["kind"]} opposes LONG')
+                s_bull = 'BULL' in structure['kind']
+                s_bear = 'BEAR' in structure['kind']
+                if bias == 'LONG' and s_bear:
+                    debug['gates'].append(f'❌ Structure ({structure["kind"]}) opposes LONG')
                     return None, debug
-                if bias == 'SHORT' and 'BULL' in structure['kind']:
-                    debug['gates'].append(f'❌ Structure {structure["kind"]} opposes SHORT')
+                if bias == 'SHORT' and s_bull:
+                    debug['gates'].append(f'❌ Structure ({structure["kind"]}) opposes SHORT')
                     return None, debug
                 debug['gates'].append(f'✅ Structure: {structure["kind"]}')
             else:
-                debug['gates'].append('⚠️ No recent BOS/MSS (continuing)')
+                debug['gates'].append('⚠️ No recent BOS/MSS (score=0 but continuing)')
 
-            # Gate 4: 1H Order Block — VOLATILITY FILTERED (v4.3)
-            obs = self.smc.find_order_blocks_filtered(df1, bias, lookback=60)
+            # Gate 4: 1H Order Block (HARD GATE)
+            obs = self.smc.find_order_blocks(df1, bias, lookback=60)
             if not obs:
-                debug['gates'].append(f'❌ No valid {bias} OBs on 1H (vol-filtered)')
+                debug['gates'].append(f'❌ No valid {bias} OBs on 1H')
                 return None, debug
-            debug['gates'].append(f'✅ {len(obs)} vol-filtered OB(s) on 1H')
+            debug['gates'].append(f'✅ {len(obs)} OB(s) found on 1H')
 
             active_ob = None
             for ob in obs:
@@ -1285,17 +580,14 @@ class SMCProScanner:
                     active_ob = ob; break
 
             if not active_ob:
-                nearest  = obs[0]
-                dist_pct = min(abs(price-nearest['top']), abs(price-nearest['bottom'])) / price * 100
-                debug['gates'].append(
-                    f'❌ Not at OB — nearest {dist_pct:.2f}% away '
-                    f'[{nearest["bottom"]:.5f}–{nearest["top"]:.5f}]'
-                )
+                nearest   = obs[0]
+                dist_pct  = min(abs(price - nearest['top']), abs(price - nearest['bottom'])) / price * 100
+                debug['gates'].append(f'❌ Price not at OB — nearest {dist_pct:.2f}% away [{nearest["bottom"]:.5f}–{nearest["top"]:.5f}]')
                 return None, debug
             debug['gates'].append(f'✅ Price IN OB [{active_ob["bottom"]:.5f}–{active_ob["top"]:.5f}]')
 
-            # FVG
-            fvgs     = self.smc.find_fvg(df1, bias, lookback=25)
+            # FVG on 1H (bonus)
+            fvgs = self.smc.find_fvg(df1, bias, lookback=25)
             fvg_near = None
             for fvg in fvgs:
                 if fvg['bottom'] < active_ob['top'] and fvg['top'] > active_ob['bottom']:
@@ -1303,36 +595,21 @@ class SMCProScanner:
             if fvg_near:
                 debug['gates'].append('✅ 1H FVG overlaps OB')
 
-            # Sweep
+            # Liquidity sweep on 1H
             sweep = self.smc.recent_liquidity_sweep(df1, bias, highs1, lows1, lookback=20)
             if sweep:
                 debug['gates'].append(f'✅ 1H liq sweep @ {sweep["level"]:.5f}')
 
-            # ── v4.3: Liquidity Context (EQH/EQL + Strong/Weak) ──
-            liq_delta, liq_block, liq_reasons = self.smc.check_liquidity_context(
-                df1, bias, active_ob, highs1, lows1
-            )
-            for r in liq_reasons:
-                debug['gates'].append(r)
-            if liq_block:
-                debug['gates'].append(f'🚫 Liquidity hard block — {bias} skipped')
-                return None, debug
-            # ─────────────────────────────────────────────────────
-
             # Score
             score, reasons, failed = score_setup(
                 bias, active_ob, structure, sweep, fvg_near,
-                df1, df15, df4, pd_label, hh_ll_ok,
-                btc_delta=btc_delta,
-                btc_reasons=btc_reasons,
-                liq_delta=liq_delta,
-                liq_reasons=liq_reasons
+                df1, df15, df4, pd_label, hh_ll_ok
             )
             debug['score'] = score
             debug['gates'] += failed
 
             if score < MIN_SCORE:
-                debug['gates'].append(f'❌ Score {score} < {MIN_SCORE}')
+                debug['gates'].append(f'❌ Score {score} < {MIN_SCORE} minimum')
                 return None, debug
 
             if   score >= 92: quality = 'ELITE 👑'
@@ -1343,26 +620,29 @@ class SMCProScanner:
             entry = price
 
             if bias == 'LONG':
-                sl = min(active_ob['bottom'] - atr1*0.2, entry - atr1*0.6)
+                sl = active_ob['bottom'] - atr1 * 0.2
+                sl = min(sl, entry - atr1 * 0.6)
             else:
-                sl = max(active_ob['top'] + atr1*0.2, entry + atr1*0.6)
+                sl = active_ob['top'] + atr1 * 0.2
+                sl = max(sl, entry + atr1 * 0.6)
 
             risk = abs(entry - sl)
             if risk < entry * 0.001:
-                debug['gates'].append('❌ Degenerate SL'); return None, debug
+                debug['gates'].append('❌ Degenerate SL')
+                return None, debug
 
-            tps = (
-                [entry+risk*1.5, entry+risk*2.5, entry+risk*4.0]
-                if bias == 'LONG' else
-                [entry-risk*1.5, entry-risk*2.5, entry-risk*4.0]
-            )
-            rr       = [abs(t-entry)/risk for t in tps]
-            risk_pct = risk/entry*100
+            if bias == 'LONG':
+                tps = [entry + risk*1.5, entry + risk*2.5, entry + risk*4.0]
+            else:
+                tps = [entry - risk*1.5, entry - risk*2.5, entry - risk*4.0]
+
+            rr       = [abs(t - entry) / risk for t in tps]
+            risk_pct = risk / entry * 100
             tid      = f"{symbol.split('/')[0]}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
 
             sig = {
                 'trade_id':    tid,
-                'symbol':      symbol.replace('/USDT:USDT',''),
+                'symbol':      symbol.replace('/USDT:USDT', ''),
                 'full_symbol': symbol,
                 'signal':      bias,
                 'quality':     quality,
@@ -1380,9 +660,6 @@ class SMCProScanner:
                 'pd_zone':     pd_label,
                 'pd_pos':      pd_pos,
                 'reasons':     reasons,
-                'btc_ctx':     btc_ctx,
-                'btc_delta':   btc_delta,
-                'btc_reasons': btc_reasons,
                 'tp_hit':      [False, False, False],
                 'sl_hit':      False,
                 'timestamp':   datetime.now(),
@@ -1395,52 +672,64 @@ class SMCProScanner:
             debug['gates'].append(f'💥 Exception: {e}')
             return None, debug
 
-    # ── Signal Card Formatter ─────────────────────────────────────
-
     def fmt(self, s):
-        icon  = '🚀' if s['signal'] == 'LONG' else '🔻'
-        arrow = '🟢 LONG' if s['signal'] == 'LONG' else '🔴 SHORT'
+        arrow    = '🟢' if s['signal'] == 'LONG' else '🔴'
+        icon     = '🚀' if s['signal'] == 'LONG' else '🔻'
+        bar      = '█' * int(s['score']/10) + '░' * (10 - int(s['score']/10))
+        z        = {'DISCOUNT':'🟩 DISCOUNT','PREMIUM':'🟥 PREMIUM','NEUTRAL':'🟨 NEUTRAL'}.get(s['pd_zone'],'')
+        ob       = s['ob']
+        hh_tag   = '🏔️ Trending (HH/LL ✅)' if s.get('hh_ll') else '〰️ Ranging (no HH/LL)'
 
-        quality_icon = {'ELITE 👑': '👑', 'PREMIUM 💎': '💎', 'HIGH 🔥': '🔥'}.get(s['quality'], '🔥')
-
-        tp1_pct = abs((s['targets'][0] - s['entry']) / s['entry'] * 100)
-        tp2_pct = abs((s['targets'][1] - s['entry']) / s['entry'] * 100)
-        tp3_pct = abs((s['targets'][2] - s['entry']) / s['entry'] * 100)
-
-        msg  = f"{'━'*26}\n"
-        msg += f"{icon} <b>{arrow} — #{s['symbol']}USDT</b>\n"
-        msg += f"{'━'*26}\n\n"
-        msg += f"{quality_icon} <b>Score: {s['score']}/100</b>\n\n"
-        msg += f"💰 <b>Entry:</b>  <code>${s['entry']:.4f}</code>\n\n"
-        msg += f"🎯 <b>TP1:</b>    <code>${s['targets'][0]:.4f}</code>  <b>(+{tp1_pct:.1f}%)</b>\n"
-        msg += f"🎯 <b>TP2:</b>    <code>${s['targets'][1]:.4f}</code>  <b>(+{tp2_pct:.1f}%)</b>\n"
-        msg += f"🎯 <b>TP3:</b>    <code>${s['targets'][2]:.4f}</code>  <b>(+{tp3_pct:.1f}%)</b>\n\n"
-        msg += f"🛑 <b>Stop:</b>   <code>${s['stop_loss']:.4f}</code>  <b>(-{s['risk_pct']:.1f}%)</b>\n\n"
-        msg += f"📊 <b>RR →</b>  1:{s['rr'][0]:.1f}  /  1:{s['rr'][1]:.1f}  /  1:{s['rr'][2]:.1f}\n\n"
-        msg += f"⚠️ <i>Risk 1-2% max — move SL to BE after TP1</i>\n"
-        msg += f"{'━'*26}"
+        msg  = f"{'━'*40}\n"
+        msg += f"{icon} <b>SMC PRO v4 — {s['quality']}</b> {icon}\n"
+        msg += f"{'━'*40}\n\n"
+        msg += f"<b>🆔</b> <code>{s['trade_id']}</code>\n"
+        msg += f"<b>📊 PAIR:</b>    <b>#{s['symbol']}USDT</b>\n"
+        msg += f"<b>📍 DIR:</b>     {arrow} <b>{s['signal']}</b>\n"
+        msg += f"<b>🗺️ ZONE:</b>    {z} ({s['pd_pos']*100:.0f}%)\n"
+        msg += f"<b>📐 4H STR:</b>  {hh_tag}\n"
+        msg += f"<b>⏱ ENTRY TF:</b> 1H candle trigger\n\n"
+        msg += f"<b>⭐ SCORE: {s['score']} / 100</b>\n"
+        msg += f"<code>[{bar}]</code>\n\n"
+        msg += f"<b>📦 ORDER BLOCK (1H):</b>\n"
+        msg += f"  Top:    <code>${ob['top']:.6f}</code>\n"
+        msg += f"  Bottom: <code>${ob['bottom']:.6f}</code>\n"
+        msg += f"  Mid:    <code>${ob['mid']:.6f}</code>\n\n"
+        msg += f"<b>💰 ENTRY NOW:</b> <code>${s['entry']:.6f}</code>\n\n"
+        msg += f"<b>🎯 TARGETS:</b>\n"
+        for (lbl, eta), tp, rr in zip(
+            [('TP1 — 50% exit','6-12h'),('TP2 — 30% exit','12-24h'),('TP3 — 20% exit','24-48h')],
+            s['targets'], s['rr']
+        ):
+            pct = abs((tp - s['entry'])/s['entry']*100)
+            msg += f"  <b>{lbl}</b> [{eta}]\n"
+            msg += f"  <code>${tp:.6f}</code>  <b>+{pct:.2f}%</b>  RR {rr:.1f}:1\n\n"
+        msg += f"<b>🛑 STOP LOSS:</b> <code>${s['stop_loss']:.6f}</code>  (-{s['risk_pct']:.2f}%)\n"
+        msg += f"  └ <i>1H close below OB = invalidated</i>\n\n"
+        if s['structure']:
+            sk  = s['structure']['kind']
+            lbl = '🔄 MSS — Early Reversal' if 'MSS' in sk else '💥 BOS — Pullback Entry'
+            msg += f"<b>🏗️ STRUCTURE:</b> {lbl}\n\n"
+        msg += f"<b>📋 CONFLUENCE:</b>\n"
+        for r in s['reasons'][:12]:
+            msg += f"  • {r}\n"
+        msg += f"\n<b>⚠️ RISK:</b> 1-2% per trade only\n"
+        msg += f"  Move SL → BE after TP1 hits\n"
+        msg += f"\n<b>📡 Live Tracking: ON</b>\n"
+        msg += f"<i>🕐 {s['timestamp'].strftime('%Y-%m-%d %H:%M UTC')}</i>\n"
+        msg += f"{'━'*40}"
         return msg
-
-    # ── Telegram Sender ───────────────────────────────────────────
 
     async def send(self, text):
         try:
-            await self.bot.send_message(
-                chat_id=self.chat_id, text=text, parse_mode=ParseMode.HTML
-            )
+            await self.bot.send_message(chat_id=self.chat_id, text=text, parse_mode=ParseMode.HTML)
         except Exception as e:
-            logger.error(f"Telegram send error: {e}")
-
-    # ── TP/SL Alerts ──────────────────────────────────────────────
+            logger.error(f"Telegram: {e}")
 
     async def tp_alert(self, t, n, price):
         tp  = t['targets'][n-1]
         pct = abs((tp - t['entry'])/t['entry']*100)
-        advice = {
-            1: 'Close 50% → Move SL to breakeven',
-            2: 'Close 30% → Trail stop tight',
-            3: 'Close final 20% 🎊'
-        }
+        advice = {1:'Close 50% → Move SL to breakeven', 2:'Close 30% → Trail stop tight', 3:'Close final 20% 🎊'}
         msg  = f"🎯 <b>TP{n} HIT!</b>\n\n<code>{t['trade_id']}</code>\n<b>{t['symbol']}</b> {t['signal']}\n\n"
         msg += f"Target: <code>${tp:.6f}</code>\nCurrent: <code>${price:.6f}</code>\nProfit: <b>+{pct:.2f}%</b>\n\n"
         msg += f"📋 {advice[n]}"
@@ -1454,10 +743,8 @@ class SMCProScanner:
         await self.send(msg)
         self.stats['sl'] += 1
 
-    # ── Trade Tracker ─────────────────────────────────────────────
-
     async def track(self):
-        logger.info("📡 Trade tracker started")
+        logger.info("📡 Tracker started")
         while True:
             try:
                 if not self.active_trades:
@@ -1473,30 +760,24 @@ class SMCProScanner:
                         if t['signal'] == 'LONG':
                             for i, tp in enumerate(t['targets']):
                                 if not t['tp_hit'][i] and p >= tp:
-                                    await self.tp_alert(t, i+1, p)
-                                    t['tp_hit'][i] = True
+                                    await self.tp_alert(t, i+1, p); t['tp_hit'][i] = True
                                     if i == 2: remove.append(tid)
                             if not t['sl_hit'] and p <= t['stop_loss']:
-                                await self.sl_alert(t, p)
-                                t['sl_hit'] = True; remove.append(tid)
+                                await self.sl_alert(t, p); t['sl_hit'] = True; remove.append(tid)
                         else:
                             for i, tp in enumerate(t['targets']):
                                 if not t['tp_hit'][i] and p <= tp:
-                                    await self.tp_alert(t, i+1, p)
-                                    t['tp_hit'][i] = True
+                                    await self.tp_alert(t, i+1, p); t['tp_hit'][i] = True
                                     if i == 2: remove.append(tid)
                             if not t['sl_hit'] and p >= t['stop_loss']:
-                                await self.sl_alert(t, p)
-                                t['sl_hit'] = True; remove.append(tid)
+                                await self.sl_alert(t, p); t['sl_hit'] = True; remove.append(tid)
                     except Exception as e:
                         logger.error(f"Track {tid}: {e}")
                 for tid in set(remove):
                     self.active_trades.pop(tid, None)
                 await asyncio.sleep(30)
             except Exception as e:
-                logger.error(f"Track loop error: {e}"); await asyncio.sleep(60)
-
-    # ── Main Scan ─────────────────────────────────────────────────
+                logger.error(f"Track loop: {e}"); await asyncio.sleep(60)
 
     async def scan(self):
         if self.is_scanning:
@@ -1504,52 +785,28 @@ class SMCProScanner:
         self.is_scanning = True
         logger.info("🔍 Scan starting...")
 
-        # Step 1: Full BTC SMC analysis — ONCE for whole scan
-        btc_ctx = await self.fetch_btc_context()
-
-        if btc_ctx:
-            em  = regime_emoji(btc_ctx['regime'])
-            st  = btc_ctx['structure']['kind'] if btc_ctx['structure'] else 'No structure'
-            ob_status = []
-            if btc_ctx['at_bull_ob']: ob_status.append('🎯 At Bull OB')
-            if btc_ctx['at_bear_ob']: ob_status.append('🎯 At Bear OB')
-            ob_str = ' | '.join(ob_status) if ob_status else '➖ Not at OB'
-
-            btc_header = (
-                f"{em} BTC: <b>{btc_ctx['regime']}</b> | ${btc_ctx['price']:,.0f}\n"
-                f"Structure: {st} | {ob_str}\n"
-                f"1H: {btc_ctx['1h_chg']:+.2f}% | 3H: {btc_ctx['3h_chg']:+.2f}% | "
-                f"RSI: {btc_ctx['rsi']:.0f}"
-            )
-        else:
-            btc_header = "⚪ BTC: data unavailable — filter skipped"
-
         await self.send(
-            f"🔍 <b>SMC v4.3 SCAN STARTED</b>\n\n"
-            f"{btc_header}\n\n"
-            f"Stack: BTC SMC → 4H trend → 1H OB + structure + trigger → 15M vol\n"
+            f"🔍 <b>SMC v4.0 SCAN STARTED</b>\n"
+            f"Entry: <b>1H trigger</b> | Structure: 1H | Trend: 4H\n"
             f"Min score: {MIN_SCORE} | OB tol: {OB_TOLERANCE_PCT*100:.1f}%\n"
-            f"Vol filter: ${MIN_VOLUME_24H/1e6:.0f}M"
+            f"Vol filter: ${MIN_VOLUME_24H/1e6:.0f}M | HH/LL bonus: +{HH_LL_BONUS}pts"
         )
 
         pairs       = await self.get_pairs()
         candidates  = []
         near_misses = []
-        btc_blocked = 0
         scanned     = 0
 
         for pair in pairs:
             try:
                 data = await self.fetch_data(pair)
                 if data:
-                    sig, dbg = self.analyse(data, pair, btc_ctx=btc_ctx)
+                    sig, dbg = self.analyse(data, pair)
                     if sig:
                         candidates.append(sig)
                         logger.info(f"  💎 {pair} {sig['signal']} score={sig['score']}")
                     else:
-                        if any('🚫 BTC' in g or 'BTC hard block' in g for g in dbg['gates']):
-                            btc_blocked += 1
-                        elif dbg['score'] > 0 and any('✅ Price IN OB' in g for g in dbg['gates']):
+                        if dbg['score'] > 0 and any('✅ Price IN OB' in g for g in dbg['gates']):
                             near_misses.append(dbg)
                 scanned += 1
                 if scanned % 30 == 0:
@@ -1560,20 +817,11 @@ class SMCProScanner:
 
         candidates.sort(key=lambda x: x['score'], reverse=True)
         top = candidates[:MAX_SIGNALS_PER_SCAN]
+
         near_misses.sort(key=lambda x: x['score'], reverse=True)
         self.last_debug = near_misses[:10]
 
         for sig in top:
-            # ── v4.3 Duplicate Filter ─────────────────────────────
-            # Skip if same symbol + same direction already active
-            already_active = any(
-                t['symbol'] == sig['symbol'] and t['signal'] == sig['signal']
-                for t in self.active_trades.values()
-            )
-            if already_active:
-                logger.info(f"⏭️ Skipping duplicate: {sig['symbol']} {sig['signal']} already active")
-                continue
-            # ─────────────────────────────────────────────────────
             self.signal_history.append(sig)
             self.active_trades[sig['trade_id']] = sig
             self.stats['total'] += 1
@@ -1584,7 +832,7 @@ class SMCProScanner:
             await self.send(self.fmt(sig))
             await asyncio.sleep(2)
 
-        self.stats['last_scan']     = datetime.now()
+        self.stats['last_scan'] = datetime.now()
         self.stats['pairs_scanned'] = scanned
 
         el = sum(1 for s in top if 'ELITE'   in s['quality'])
@@ -1593,45 +841,38 @@ class SMCProScanner:
         lg = sum(1 for s in top if s['signal'] == 'LONG')
         tr = sum(1 for s in top if s.get('hh_ll'))
 
-        summ  = f"✅ <b>SCAN COMPLETE — v4.3</b>\n\n"
-        if btc_ctx:
-            summ += f"🟠 BTC: {btc_ctx['regime']} | {btc_ctx['1h_chg']:+.2f}% (1H)\n"
-        summ += f"📊 Pairs scanned:  {scanned}\n"
-        summ += f"🚫 BTC blocked:    {btc_blocked}\n"
-        summ += f"🔍 Candidates:     {len(candidates)}\n"
-        summ += f"🎯 Signals sent:   {len(top)}\n"
+        summ  = f"✅ <b>SCAN COMPLETE — v4.0</b>\n\n"
+        summ += f"📊 Pairs scanned: {scanned}\n"
+        summ += f"🔍 Candidates:    {len(candidates)}\n"
+        summ += f"🎯 Signals sent:  {len(top)}\n"
         if top:
-            summ += f"  👑 Elite: {el}  💎 Premium: {pr}  🔥 High: {hi}\n"
-            summ += f"  🟢 Long: {lg}  🔴 Short: {len(top)-lg}\n"
-            summ += f"  🏔️ Trending: {tr}  〰️ Ranging: {len(top)-tr}\n"
+            summ += f"  👑 Elite:    {el}\n  💎 Premium:  {pr}\n  🔥 High:     {hi}\n"
+            summ += f"  🟢 Long:     {lg}\n  🔴 Short:    {len(top)-lg}\n"
+            summ += f"  🏔️ Trending: {tr}\n  〰️ Ranging:  {len(top)-tr}\n"
         else:
             summ += f"\n<i>No setups met criteria this scan.</i>\n"
             summ += f"Near misses: {len(near_misses)} — use /debug\n"
         summ += f"\n⏰ {datetime.now().strftime('%H:%M UTC')}"
         await self.send(summ)
 
-        logger.info(f"✅ Done. {len(candidates)} candidates → {len(top)} sent. BTC blocked: {btc_blocked}")
+        logger.info(f"✅ Done. {len(candidates)} candidates → {len(top)} sent.")
         self.is_scanning = False
         return top
 
     async def run(self, interval_min=SCAN_INTERVAL_MIN):
-        logger.info("🚀 SMC Pro v4.3 starting")
+        logger.info("🚀 SMC Pro v4.0 starting")
         await self.send(
-            "👑 <b>SMC PRO v4.3 — LIQUIDITY AWARENESS</b> 👑\n\n"
+            "👑 <b>SMC PRO v4.0 — ORDER BLOCK SCANNER</b> 👑\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>BTC Full SMC  →  4H Trend  →  1H OB+Structure+Trigger  →  Liq Check  →  15M Vol</b>\n\n"
-            "v4.3 NEW — Liquidity Awareness Engine:\n"
-            "  ✅ Equal Highs/Lows (EQH/EQL) detection\n"
-            "  ✅ Unswept EQH above LONG → blocked\n"
-            "  ✅ Swept EQH/EQL → +6pts bonus (fuel confirmed)\n"
-            "  ✅ Weak High above OB → -6pts (stop hunt risk)\n"
-            "  ✅ Strong Low below OB → +5pts (structure floor)\n"
-            "  ✅ Volatility OB filter (news spike candles excluded)\n\n"
-            "Full stack:\n"
-            "  BTC SMC → 4H trend → 1H structure → Vol-filtered OB\n"
-            "  → EQH/EQL check → Strong/Weak levels → Trigger → Score\n\n"
-            f"Min score: {MIN_SCORE} | Scan: every {SCAN_INTERVAL_MIN}min\n\n"
-            "Commands: /scan /btc /stats /trades /debug /help\n"
+            "<b>4H Trend  →  1H Structure + OB + Entry  →  15M Vol</b>\n\n"
+            f"✅ Entry trigger: <b>1H candles</b> (upgraded from 15M)\n"
+            f"✅ Min score: {MIN_SCORE}/100\n"
+            f"✅ OB tolerance: {OB_TOLERANCE_PCT*100:.1f}%\n"
+            f"✅ Vol filter: ${MIN_VOLUME_24H/1e6:.0f}M/day\n"
+            f"✅ 4H HH/LL bonus: +{HH_LL_BONUS}pts\n"
+            f"✅ Trade timeout: 48H\n"
+            f"✅ Scan every: {SCAN_INTERVAL_MIN} min\n\n"
+            "Commands: /scan /stats /trades /debug /help\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
         asyncio.create_task(self.track())
@@ -1641,15 +882,15 @@ class SMCProScanner:
                 logger.info(f"💤 Next scan in {interval_min}m")
                 await asyncio.sleep(interval_min * 60)
             except Exception as e:
-                logger.error(f"Main loop: {e}"); await asyncio.sleep(60)
+                logger.error(f"Main: {e}"); await asyncio.sleep(60)
 
     async def close(self):
         await self.exchange.close()
 
 
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 #  BOT COMMANDS
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 
 class Commands:
     def __init__(self, s: SMCProScanner):
@@ -1657,11 +898,10 @@ class Commands:
 
     async def start(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(
-            "👑 <b>SMC Pro v4.3 — Full BTC SMC Engine</b>\n\n"
-            "BTC is now fully analysed with the same SMC stack as every alt:\n"
-            "regime, structure, OB, sweep, FVG, trigger candle.\n\n"
-            "Stack: BTC Full SMC → 4H trend → 1H OB+structure+trigger → 15M vol\n\n"
-            "/scan /btc /stats /trades /debug /help",
+            "👑 <b>SMC Pro v4.0</b>\n\n"
+            "1H entry trigger — cleaner, stronger signals.\n\n"
+            "Stack: 4H trend → 1H structure + OB + trigger → 15M vol\n\n"
+            "/scan /stats /trades /debug /help",
             parse_mode=ParseMode.HTML
         )
 
@@ -1671,87 +911,17 @@ class Commands:
         await u.message.reply_text("🔍 Manual scan started...")
         asyncio.create_task(self.s.scan())
 
-    async def cmd_btc(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        """Full BTC SMC snapshot — the flagship /btc command."""
-        await u.message.reply_text("🟠 Running full BTC SMC analysis...")
-        ctx = await self.s.fetch_btc_context()
-        if not ctx:
-            await u.message.reply_text("❌ Failed to fetch BTC data."); return
-
-        em    = regime_emoji(ctx['regime'])
-        st    = ctx['structure']['kind'] if ctx['structure'] else 'None detected'
-        st_lvl= f" @ {ctx['structure']['level']:.0f}" if ctx['structure'] else ''
-
-        ob_bull = ctx['ob_bull']
-        ob_bear = ctx['ob_bear']
-        ob_bull_str = f"[{ob_bull['bottom']:.0f}–{ob_bull['top']:.0f}]" if ob_bull else "None"
-        ob_bear_str = f"[{ob_bear['bottom']:.0f}–{ob_bear['top']:.0f}]" if ob_bear else "None"
-
-        sweep = ctx['sweep']
-        sweep_str = f"{sweep['type']} @ {sweep['level']:.0f}" if sweep else "None"
-
-        fvg_bull = ctx['fvg_bull']
-        fvg_bear = ctx['fvg_bear']
-        fvg_bull_str = f"[{fvg_bull['bottom']:.0f}–{fvg_bull['top']:.0f}]" if fvg_bull else "None"
-        fvg_bear_str = f"[{fvg_bear['bottom']:.0f}–{fvg_bear['top']:.0f}]" if fvg_bear else "None"
-
-        # Impact on alts
-        d_long,  blk_long,  lbl_long,  r_long  = check_btc_alignment(ctx, 'LONG')
-        d_short, blk_short, lbl_short, r_short = check_btc_alignment(ctx, 'SHORT')
-
-        long_impact  = "🚫 HARD BLOCKED" if blk_long  else f"{'+' if d_long>=0 else ''}{d_long}pts"
-        short_impact = "🚫 HARD BLOCKED" if blk_short else f"{'+' if d_short>=0 else ''}{d_short}pts"
-
-        msg  = f"🟠 <b>BTC FULL SMC ANALYSIS v4.3</b>\n"
-        msg += f"{'━'*38}\n\n"
-        msg += f"<b>💰 Price:</b>  <code>${ctx['price']:,.2f}</code>\n"
-        msg += f"<b>🏷️ Regime:</b> {em} <b>{ctx['regime']}</b>\n"
-        msg += f"<b>📊 Trend:</b>  {ctx['ema_trend']}\n"
-        msg += f"<b>🗺️ PD Zone:</b> {ctx['pd_zone']} ({ctx['pd_pos']*100:.0f}%)\n"
-        msg += f"<b>🏔️ HH/LL:</b>  {'✅ YES — ' + ctx['hh_ll_msg'] if ctx['hh_ll'] else '❌ NO — ranging'}\n\n"
-
-        msg += f"<b>🏗️ 1H Structure:</b> {st}{st_lvl}\n\n"
-
-        msg += f"<b>📦 Order Blocks:</b>\n"
-        msg += f"  Bull OB: {ob_bull_str} {'🎯 PRICE HERE' if ctx['at_bull_ob'] else ''}\n"
-        msg += f"  Bear OB: {ob_bear_str} {'🎯 PRICE HERE' if ctx['at_bear_ob'] else ''}\n\n"
-
-        msg += f"<b>💧 Liq Sweep:</b> {sweep_str}\n\n"
-
-        msg += f"<b>⚡ FVGs:</b>\n"
-        msg += f"  Bull FVG: {fvg_bull_str}\n"
-        msg += f"  Bear FVG: {fvg_bear_str}\n\n"
-
-        msg += f"<b>🕯️ Trigger Candle:</b> {ctx['trigger_label'] or 'None'}\n\n"
-
-        msg += f"<b>📈 Momentum:</b>\n"
-        msg += f"  RSI: {ctx['rsi']:.1f}\n"
-        msg += f"  MACD: {'📈 Bull' if ctx['macd_bull'] else '📉 Bear'}\n"
-        msg += f"  1H move: {ctx['1h_chg']:+.2f}%\n"
-        msg += f"  3H move: {ctx['3h_chg']:+.2f}%\n"
-        msg += f"  15M vol: {ctx['vol_ratio_15m']:.1f}x\n\n"
-
-        msg += f"<b>🎯 Alt Signal Impact:</b>\n"
-        msg += f"  LONG signals:  {long_impact}\n"
-        msg += f"  SHORT signals: {short_impact}\n"
-        if r_long:
-            for r in r_long: msg += f"    • {r}\n"
-
-        msg += f"\n<i>🕐 {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}</i>"
-        await u.message.reply_text(msg, parse_mode=ParseMode.HTML)
-
     async def stats(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         s = self.s.stats
-        msg  = "📊 <b>SMC PRO v4.3 STATS</b>\n\n"
+        msg  = "📊 <b>SMC PRO v4.0 STATS</b>\n\n"
         msg += f"Total signals: {s['total']}\n"
         msg += f"  👑 Elite: {s['elite']}  💎 Premium: {s['premium']}  🔥 High: {s['high']}\n"
         msg += f"  🟢 Long: {s['long']}  🔴 Short: {s['short']}\n\n"
-        msg += f"🚫 BTC blocked (all-time): {s['btc_blocks']}\n\n"
         msg += f"TP1: {s['tp1']} | TP2: {s['tp2']} | TP3: {s['tp3']} | SL: {s['sl']}\n\n"
         if s['last_scan']:
             msg += f"Last scan: {s['last_scan'].strftime('%H:%M UTC')}\n"
             msg += f"Pairs: {s['pairs_scanned']}\n"
-        msg += f"Active trades: {len(self.s.active_trades)}"
+        msg += f"Active: {len(self.s.active_trades)}"
         await u.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
     async def trades(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -1759,73 +929,61 @@ class Commands:
             await u.message.reply_text("📭 No active trades."); return
         msg = f"📡 <b>ACTIVE TRADES ({len(self.s.active_trades)})</b>\n\n"
         for tid, t in list(self.s.active_trades.items())[:10]:
-            age       = int((datetime.now()-t['timestamp']).total_seconds()/3600)
-            tps       = ''.join(['✅' if h else '⏳' for h in t['tp_hit']])
+            age      = int((datetime.now() - t['timestamp']).total_seconds()/3600)
+            tps      = ''.join(['✅' if h else '⏳' for h in t['tp_hit']])
             trend_tag = '🏔️' if t.get('hh_ll') else '〰️'
-            btc_reg   = t.get('btc_ctx',{}).get('regime','?') if t.get('btc_ctx') else '?'
-            msg += (
-                f"<b>{t['symbol']}</b> {t['signal']} {trend_tag} — {t['quality']}\n"
-                f"  Entry: <code>${t['entry']:.5f}</code> | Score: {t['score']}\n"
-                f"  BTC was: {btc_reg} | TPs: {tps} | {age}h old\n\n"
-            )
+            msg += (f"<b>{t['symbol']}</b> {t['signal']} {trend_tag} — {t['quality']}\n"
+                    f"  Entry: <code>${t['entry']:.5f}</code> | Score: {t['score']}\n"
+                    f"  TPs: {tps} | {age}h old\n\n")
         await u.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
     async def debug(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         if not self.s.last_debug:
-            await u.message.reply_text("📭 No debug data yet. Run /scan first."); return
+            await u.message.reply_text("📭 No debug data yet. Run /scan first.", parse_mode=ParseMode.HTML)
+            return
         msg = "🔬 <b>NEAR MISSES — Last Scan</b>\n"
         msg += "<i>(At OB but below score threshold)</i>\n\n"
         for d in self.s.last_debug[:8]:
             msg += f"<b>{d['symbol']}</b> {d['bias']} — Score: {d['score']}/100\n"
-            for g in d['gates'][-5:]:
+            for g in d['gates'][-4:]:
                 msg += f"  {g}\n"
             msg += "\n"
-        msg += f"<i>Min score: {MIN_SCORE}</i>"
+        msg += f"<i>Min score: {MIN_SCORE}. 1H trigger = up to +25pts.</i>"
         await u.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
     async def help(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        msg  = "📚 <b>SMC PRO v4.3 — FULL STRATEGY</b>\n\n"
-        msg += "<b>Scan Stack (in order):</b>\n"
-        msg += "  0️⃣ BTC Full SMC  (regime + hard blocks)\n"
-        msg += "  1️⃣ ALT 4H EMA bias\n"
-        msg += "  2️⃣ PD zone filter\n"
-        msg += "  3️⃣ ALT 1H BOS/MSS\n"
-        msg += "  4️⃣ ALT 1H Order Block (volatility filtered) ← v4.3\n"
-        msg += "  5️⃣ EQH/EQL liquidity check ← v4.3\n"
-        msg += f"  6️⃣ Score ≥ {MIN_SCORE}/100\n\n"
-        msg += "<b>v4.3 Liquidity Awareness:</b>\n"
-        msg += f"  🚫 Unswept EQH above LONG OB → hard block\n"
-        msg += f"  🚫 Unswept EQL below SHORT OB → hard block\n"
-        msg += f"  💧 EQH/EQL already swept → +{EQL_SWEPT_BONUS}pts (fuel)\n"
-        msg += f"  ⚠️ Weak High in LONG path → -{WEAK_LEVEL_PENALTY}pts\n"
-        msg += f"  ⚠️ Weak Low in SHORT path → -{WEAK_LEVEL_PENALTY}pts\n"
-        msg += f"  🏔️ Strong Low supports LONG → +{STRONG_LEVEL_BONUS}pts\n"
-        msg += f"  🏔️ Strong High resists SHORT → +{STRONG_LEVEL_BONUS}pts\n"
-        msg += f"  🔇 News spike candles excluded from OB detection\n\n"
-        msg += "<b>BTC Regimes:</b>\n"
-        msg += "  🟢🟢 BULL_CONFIRMED  🟢 BULL_STRUCTURE  🟡🟢 BULL_RANGING\n"
-        msg += "  🔴🔴 BEAR_CONFIRMED  🔴 BEAR_STRUCTURE  🟡🔴 BEAR_RANGING\n"
-        msg += "  🔄🟢 REVERSAL_BULL   🔄🔴 REVERSAL_BEAR  🟡 RANGING\n\n"
-        msg += "<b>Score System:</b>\n"
-        msg += "  +25 — 1H trigger candle\n"
+        msg  = "📚 <b>SMC PRO v4.0 — STRATEGY</b>\n\n"
+        msg += "<b>Timeframe Stack:</b>\n"
+        msg += "  4H  → EMA bias + HH/LL depth\n"
+        msg += "  1H  → BOS/MSS + OB zone + Entry trigger  ← core\n"
+        msg += "  15M → Volume spike bonus only\n\n"
+        msg += "<b>Hard Gates (ALL must pass):</b>\n"
+        msg += "  1️⃣ 4H EMA 21/50 bias\n"
+        msg += "  2️⃣ PD zone (no longs premium / no shorts discount)\n"
+        msg += "  3️⃣ 1H BOS/MSS within 20 candles\n"
+        msg += "  4️⃣ Price at valid 1H Order Block\n"
+        msg += f"  5️⃣ Score ≥ {MIN_SCORE}/100\n\n"
+        msg += "<b>Score System (max 100):</b>\n"
+        msg += "  +25 — 1H entry trigger (engulf/pin/hammer) ⭐ main\n"
         msg += "  +20 — MSS structure\n"
-        msg += "  +20 — Tight OB (vol-filtered)\n"
+        msg += "  +20 — Tight OB quality\n"
         msg += "  +15 — 4H triple EMA\n"
-        msg += f"  +15 — BTC CONFIRMED regime\n"
-        msg += f"  +{HH_LL_BONUS}  — 4H HH/LL\n"
-        msg += f"  +{EQL_SWEPT_BONUS}  — EQH/EQL swept (fuel) ← v4.3\n"
-        msg += f"  +{STRONG_LEVEL_BONUS}  — Strong level support ← v4.3\n"
-        msg += f"  -{WEAK_LEVEL_PENALTY}  — Weak level in path ← v4.3\n"
-        msg += "  +12 — Momentum\n"
-        msg += "  +10 — Extras\n\n"
-        msg += "<b>Commands:</b>\n"
-        msg += "  /btc    /scan    /stats    /trades    /debug"
+        msg += f"  +{HH_LL_BONUS}  — 4H HH/LL confirmed\n"
+        msg += "  +12 — Momentum (RSI/MACD/Stoch)\n"
+        msg += "  +10 — Extras (sweep/FVG/vol)\n\n"
+        msg += "<b>TP timing adjusted for 1H entries:</b>\n"
+        msg += "  TP1 = 1:1.5 RR  [6-12h]\n"
+        msg += "  TP2 = 1:2.5 RR  [12-24h]\n"
+        msg += "  TP3 = 1:4.0 RR  [24-48h]\n\n"
+        msg += "<b>Config:</b>\n"
+        msg += f"  MIN_SCORE={MIN_SCORE} | HH_LL_BONUS={HH_LL_BONUS}\n"
+        msg += f"  OB_TOLERANCE={OB_TOLERANCE_PCT} | LOOKBACK={HH_LL_LOOKBACK}"
         await u.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 #  ENTRY POINT
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 
 async def main():
     # ════════════ CONFIG ════════════
@@ -1847,7 +1005,6 @@ async def main():
 
     app.add_handler(CommandHandler("start",  cmds.start))
     app.add_handler(CommandHandler("scan",   cmds.cmd_scan))
-    app.add_handler(CommandHandler("btc",    cmds.cmd_btc))
     app.add_handler(CommandHandler("stats",  cmds.stats))
     app.add_handler(CommandHandler("trades", cmds.trades))
     app.add_handler(CommandHandler("debug",  cmds.debug))
@@ -1855,7 +1012,7 @@ async def main():
 
     await app.initialize()
     await app.start()
-    logger.info("🤖 SMC Pro v4.3 ready!")
+    logger.info("🤖 SMC Pro v4.0 ready!")
 
     try:
         await scanner.run(interval_min=SCAN_INTERVAL_MIN)
