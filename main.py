@@ -1,73 +1,72 @@
 """
-SMC PRO SCANNER v4.2 — "BTC AS THE KING"
+SMC PRO SCANNER v4.3 — "LIQUIDITY AWARENESS"
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CHANGES from v4.1:
+CHANGES from v4.2  (engine only — signal card unchanged):
 
-  BTC FULL SMC ANALYSIS (the big upgrade):
-  ─────────────────────────────────────────
-  BTC now gets the FULL SMC treatment — same engine used
-  on every alt pair, but applied to BTC itself across
-  3 timeframes (4H, 1H, 15M). This gives a complete
-  BTC structural picture before any alt signal fires.
+  3 NEW ACCURACY UPGRADES from LuxAlgo SMC analysis:
+  ────────────────────────────────────────────────────
 
-  What BTC analysis now checks:
-    ✅ 4H EMA trend (STRONG_BULL / BULL / RANGING / BEAR / STRONG_BEAR)
-    ✅ 4H HH/LL — is BTC in a trending or ranging phase?
-    ✅ 4H PD zone — is BTC in discount (potential bounce) or premium (potential dump)?
-    ✅ 1H BOS/MSS — did BTC just break structure? Which direction?
-    ✅ 1H Order Block — is BTC sitting at its own OB? Top/bottom/mid printed
-    ✅ 1H Liquidity Sweep — did BTC just sweep lows/highs before moving?
-    ✅ 1H FVG — is there a Fair Value Gap on BTC right now?
-    ✅ 1H Trigger candle — engulfing/pin/hammer on BTC itself
-    ✅ 1H price momentum (1H chg%, 3H chg%)
-    ✅ 15M volume — is BTC seeing a volume spike right now?
+  1. EQUAL HIGHS / EQUAL LOWS (EQH/EQL) — Liquidity Awareness
+     ──────────────────────────────────────────────────────────
+     Detects when price has formed two highs or lows at nearly
+     the same level. This means LIQUIDITY IS RESTING THERE.
+     Smart money will hunt it before moving the real direction.
 
-  BTC Regime Labels (replaces simple trend label):
-    BULL_CONFIRMED   — 4H bull + 1H BOS_BULL + 1H bull trigger
-    BULL_STRUCTURE   — 4H bull + 1H BOS_BULL (no trigger yet)
-    BULL_RANGING     — 4H bull but no BOS yet
-    BEAR_CONFIRMED   — 4H bear + 1H BOS_BEAR + 1H bear trigger
-    BEAR_STRUCTURE   — 4H bear + 1H BOS_BEAR (no trigger yet)
-    BEAR_RANGING     — 4H bear but no BOS yet
-    REVERSAL_BULL    — 4H bear BUT 1H MSS_BULL — potential flip
-    REVERSAL_BEAR    — 4H bull BUT 1H MSS_BEAR — potential flip
-    RANGING          — No clear bias on either timeframe
+     Logic (your choice: both — bonus if swept, block if not):
+       EQH above price + NOT yet swept → block LONG
+         (price will likely get swept up first = bad entry)
+       EQH above price + ALREADY swept → +6 pts bonus for LONG
+         (liquidity cleared = fuel for real move up)
+       EQL below price + NOT yet swept → block SHORT
+         (price will likely get swept down first = bad entry)
+       EQL below price + ALREADY swept → +6 pts bonus for SHORT
+         (liquidity cleared = fuel for real move down)
 
-  Hard Block Logic (upgraded):
-    BEAR_CONFIRMED + price near OB resistance → block ALL LONGS
-    BULL_CONFIRMED + price near OB support    → block ALL SHORTS
-    BTC 1H sweep DOWN + no recovery           → block LONGS
-    BTC 1H dump >2.5%                         → block LONGS
-    BTC 1H pump >2.5%                         → block SHORTS
-    REVERSAL_BEAR forming                     → block LONGS (early warning)
-    REVERSAL_BULL forming                     → block SHORTS (early warning)
+     Detection method:
+       Swing highs within EQH_THRESHOLD * ATR of each other
+       within last EQH_LOOKBACK candles = Equal High
+       Same logic for Equal Lows
 
-  Score modifier matrix (upgraded from v4.1):
-    BULL_CONFIRMED   → LONG +15, SHORT -18
-    BULL_STRUCTURE   → LONG +10, SHORT -12
-    BULL_RANGING     → LONG  +5, SHORT  -6
-    BEAR_CONFIRMED   → SHORT +15, LONG -18
-    BEAR_STRUCTURE   → SHORT +10, LONG -12
-    BEAR_RANGING     → SHORT  +5, LONG  -6
-    REVERSAL_BULL    → LONG  +8, SHORT -10  (early flip)
-    REVERSAL_BEAR    → SHORT +8, LONG  -10  (early flip)
-    RANGING          → neutral (0)
-    BTC at own OB    → +5 pts (aligned direction)
-    BTC sweep done   → +4 pts (liquidity cleared)
-    BTC FVG present  → +3 pts (magnet for price)
-    BTC 15M vol spike→ +2 pts
+  2. STRONG / WEAK HIGH & LOW labelling
+     ─────────────────────────────────────
+     Every swing point is now classified:
+       Strong High = price broke ABOVE it (BOS confirmed)
+                   → this level is now support, not resistance
+       Weak High   = price has NOT broken above it yet
+                   → liquidity sitting above, danger for longs
+       Strong Low  = price broke BELOW it (BOS confirmed)
+                   → this level is now resistance, not support
+       Weak Low    = price has NOT broken below it yet
+                   → liquidity sitting below, danger for shorts
 
-  New /btc command output:
-    Now shows full BTC SMC breakdown:
-    regime, structure, OB levels, sweep, FVG,
-    trigger candle, 4H PD zone, HH/LL status
+     How it affects signals:
+       LONG entry with a Weak High directly above OB  → -6 pts
+         (price likely to get swept up before real move)
+       LONG entry with nearest Strong Low below entry → +5 pts
+         (solid structural support underneath)
+       SHORT entry with a Weak Low directly below OB  → -6 pts
+       SHORT entry with nearest Strong High above     → +5 pts
 
-TIMEFRAME ROLES v4.2:
-  BTC 4H  → EMA trend + HH/LL + PD zone
-  BTC 1H  → BOS/MSS + OB + sweep + FVG + trigger candle  ← FULL SMC
-  BTC 15M → Volume spike on BTC
+  3. VOLATILITY OB FILTER (from LuxAlgo)
+     ──────────────────────────────────────
+     If a candle's range > 2x ATR it's a high-volatility
+     (news spike) candle. OBs formed on these candles are
+     unreliable — price moved due to news not structure.
+     These candles are now EXCLUDED from OB detection.
+
+     Effect: Fewer but significantly higher quality OBs.
+     Wide-range news candles no longer pollute the OB list.
+
+TUNABLE SETTINGS (new):
+  EQH_LOOKBACK      = 30   candles to look back for EQH/EQL
+  EQH_THRESHOLD     = 0.5  ATR multiplier for "equal" tolerance
+  WEAK_HIGH_WINDOW  = 10   candles ahead of OB to check for weak high
+  VOL_OB_FILTER_ATR = 2.0  candle range multiplier to flag news spike
+
+TIMEFRAME ROLES v4.3: (unchanged from v4.2)
+  BTC 4H/1H/15M → Full SMC king filter
   ALT 4H  → EMA bias + HH/LL
-  ALT 1H  → BOS/MSS + OB + entry trigger
+  ALT 1H  → BOS/MSS + OB (volatility filtered) + EQH/EQL + Strong/Weak + trigger
   ALT 15M → Volume bonus
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
@@ -99,7 +98,7 @@ MIN_VOLUME_24H        = 5_000_000
 OB_TOLERANCE_PCT      = 0.008
 OB_IMPULSE_ATR_MULT   = 1.0
 STRUCTURE_LOOKBACK    = 20
-SCAN_INTERVAL_MIN     = 60
+SCAN_INTERVAL_MIN     = 30
 HH_LL_LOOKBACK        = 10
 HH_LL_BONUS           = 8
 
@@ -125,6 +124,16 @@ BTC_OB_BONUS     = 5   # BTC at own OB aligned with signal direction
 BTC_SWEEP_BONUS  = 4   # BTC just swept liquidity (cleared stops)
 BTC_FVG_BONUS    = 3   # BTC has open FVG in signal direction
 BTC_VOL_BONUS    = 2   # BTC 15M volume spike
+
+# ── v4.3 Liquidity Awareness Settings ──────────────────────────
+EQH_LOOKBACK        = 30    # candles to scan back for equal highs/lows
+EQH_THRESHOLD       = 0.5   # ATR multiplier — how close = "equal"
+EQL_SWEPT_BONUS     = 6     # pts bonus when EQH/EQL already swept (fuel)
+EQL_UNSWEPT_BLOCK   = True  # hard block if unswept EQH/EQL directly in signal path
+WEAK_LEVEL_PENALTY  = 6     # pts penalty — weak high/low sitting in signal path
+STRONG_LEVEL_BONUS  = 5     # pts bonus — strong high/low as structural support
+WEAK_LEVEL_WINDOW   = 15    # candles above/below OB to check for weak high/low
+VOL_OB_FILTER_ATR   = 2.0   # candle range > this * ATR = news spike, skip as OB
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -377,6 +386,280 @@ class SMCEngine:
         elif pos > 0.60: return 'PREMIUM',  pos
         return 'NEUTRAL', pos
 
+    # ══════════════════════════════════════════════
+    #  v4.3 NEW METHODS
+    # ══════════════════════════════════════════════
+
+    def is_volatility_candle(self, df, i):
+        """
+        Returns True if candle i is a high-volatility news spike.
+        Range > VOL_OB_FILTER_ATR * ATR = unreliable OB source.
+        Inspired by LuxAlgo's parsedHigh/parsedLow filter.
+        """
+        if 'atr' not in df.columns: return False
+        atr = df['atr'].iloc[i]
+        if pd.isna(atr) or atr == 0: return False
+        candle_range = df['high'].iloc[i] - df['low'].iloc[i]
+        return candle_range > VOL_OB_FILTER_ATR * atr
+
+    def find_order_blocks_filtered(self, df, direction, lookback=60):
+        """
+        find_order_blocks with volatility spike filtering.
+        OBs formed on news candles (range > 2x ATR) are excluded.
+        Same logic as base method — just skips high-vol candles.
+        """
+        obs = []
+        n = len(df)
+        start = max(2, n - lookback)
+
+        for i in range(start, n - 3):
+            # ── v4.3: skip news spike candles as OB source ─────
+            if self.is_volatility_candle(df, i):
+                continue
+            # ───────────────────────────────────────────────────
+
+            c = df.iloc[i]
+            atr_local = (
+                df['atr'].iloc[i]
+                if 'atr' in df.columns and not pd.isna(df['atr'].iloc[i])
+                else (c['high'] - c['low'])
+            )
+            min_impulse = atr_local * OB_IMPULSE_ATR_MULT
+
+            if direction == 'LONG':
+                if c['close'] >= c['open']: continue
+                fwd_high = df['high'].iloc[i+1:min(i+5, n)].max()
+                if fwd_high - c['low'] < min_impulse: continue
+                ob = {
+                    'top':    max(c['open'], c['close']),
+                    'bottom': c['low'],
+                    'mid':   (max(c['open'], c['close']) + c['low']) / 2,
+                    'bar':    i,
+                    'vol_filtered': True
+                }
+                if (df['close'].iloc[i+1:n] < (ob['top']+ob['bottom'])/2).any(): continue
+                obs.append(ob)
+            else:
+                if c['close'] <= c['open']: continue
+                fwd_low = df['low'].iloc[i+1:min(i+5, n)].min()
+                if c['high'] - fwd_low < min_impulse: continue
+                ob = {
+                    'top':    c['high'],
+                    'bottom': min(c['open'], c['close']),
+                    'mid':   (c['high'] + min(c['open'], c['close'])) / 2,
+                    'bar':    i,
+                    'vol_filtered': True
+                }
+                if (df['close'].iloc[i+1:n] > (ob['top']+ob['bottom'])/2).any(): continue
+                obs.append(ob)
+
+        obs.sort(key=lambda x: x['bar'], reverse=True)
+        return obs
+
+    def detect_equal_highs_lows(self, df, highs, lows, lookback=None):
+        """
+        Detect Equal Highs (EQH) and Equal Lows (EQL).
+        Two swing points are 'equal' if within EQH_THRESHOLD * ATR.
+        Returns lists of EQH and EQL price levels with sweep status.
+
+        Each entry: {'level': float, 'swept': bool, 'bar': int}
+        'swept' = True if price has already traded through the level
+        """
+        if lookback is None: lookback = EQH_LOOKBACK
+        n   = len(df)
+        atr = df['atr'].iloc[-1] if 'atr' in df.columns else (df['high'].iloc[-1] - df['low'].iloc[-1])
+        if pd.isna(atr) or atr == 0: atr = df['close'].iloc[-1] * 0.001
+        threshold = EQH_THRESHOLD * atr
+
+        price     = df['close'].iloc[-1]
+        start_bar = max(0, n - lookback)
+
+        recent_highs = [h for h in highs if h['i'] >= start_bar]
+        recent_lows  = [l for l in lows  if l['i'] >= start_bar]
+
+        eqh_list = []
+        eql_list = []
+
+        # Equal Highs — two swing highs within threshold of each other
+        for i in range(len(recent_highs)):
+            for j in range(i+1, len(recent_highs)):
+                h1 = recent_highs[i]; h2 = recent_highs[j]
+                if abs(h1['price'] - h2['price']) <= threshold:
+                    level = (h1['price'] + h2['price']) / 2
+                    # Swept = price has already traded above this level
+                    swept = price > level
+                    # Only relevant if level is above current price (or just swept)
+                    if level >= price * 0.995:  # within 0.5% above or already above
+                        eqh_list.append({
+                            'level': level,
+                            'swept': swept,
+                            'bar':   max(h1['i'], h2['i'])
+                        })
+
+        # Equal Lows — two swing lows within threshold
+        for i in range(len(recent_lows)):
+            for j in range(i+1, len(recent_lows)):
+                l1 = recent_lows[i]; l2 = recent_lows[j]
+                if abs(l1['price'] - l2['price']) <= threshold:
+                    level = (l1['price'] + l2['price']) / 2
+                    swept = price < level
+                    if level <= price * 1.005:  # within 0.5% below or already below
+                        eql_list.append({
+                            'level': level,
+                            'swept': swept,
+                            'bar':   max(l1['i'], l2['i'])
+                        })
+
+        # Keep only most recent unique levels
+        eqh_list.sort(key=lambda x: x['bar'], reverse=True)
+        eql_list.sort(key=lambda x: x['bar'], reverse=True)
+        return eqh_list[:3], eql_list[:3]
+
+    def classify_swing_levels(self, df, highs, lows, lookback=None):
+        """
+        Classify swing highs as Strong or Weak, and swing lows as Strong or Weak.
+        Strong High = price has since broken ABOVE it (confirmed BOS)
+        Weak High   = price has NOT yet broken above it (liquidity resting)
+        Strong Low  = price has since broken BELOW it
+        Weak Low    = price has NOT broken below it
+
+        Returns:
+          strong_highs: list of {'price', 'bar'}
+          weak_highs:   list of {'price', 'bar'}
+          strong_lows:  list of {'price', 'bar'}
+          weak_lows:    list of {'price', 'bar'}
+        """
+        if lookback is None: lookback = WEAK_LEVEL_WINDOW * 3
+        n     = len(df)
+        start = max(0, n - lookback)
+        close = df['close']
+
+        strong_highs, weak_highs   = [], []
+        strong_lows,  weak_lows    = [], []
+
+        for h in highs:
+            if h['i'] < start: continue
+            level = h['price']
+            # Check if price ever closed above this level after the swing
+            future_closes = close.iloc[h['i']+1:n]
+            if (future_closes > level).any():
+                strong_highs.append({'price': level, 'bar': h['i']})
+            else:
+                weak_highs.append({'price': level, 'bar': h['i']})
+
+        for l in lows:
+            if l['i'] < start: continue
+            level = l['price']
+            future_closes = close.iloc[l['i']+1:n]
+            if (future_closes < level).any():
+                strong_lows.append({'price': level, 'bar': l['i']})
+            else:
+                weak_lows.append({'price': level, 'bar': l['i']})
+
+        return strong_highs, weak_highs, strong_lows, weak_lows
+
+    def check_liquidity_context(self, df, direction, ob, highs, lows):
+        """
+        Master liquidity check combining EQH/EQL and Strong/Weak levels.
+        Called per signal to produce score delta + reasons + hard_block flag.
+
+        Returns: (score_delta, hard_block, reasons_list)
+        """
+        score_delta = 0
+        hard_block  = False
+        reasons     = []
+        price       = df['close'].iloc[-1]
+
+        atr = df['atr'].iloc[-1] if 'atr' in df.columns else price * 0.001
+        if pd.isna(atr) or atr == 0: atr = price * 0.001
+
+        # ── EQH/EQL Detection ─────────────────────────────────
+        eqh_list, eql_list = self.detect_equal_highs_lows(df, highs, lows)
+
+        if direction == 'LONG':
+            # EQH above OB — liquidity resting above
+            for eqh in eqh_list:
+                if eqh['level'] > ob['top']:
+                    if eqh['swept']:
+                        # Already swept — liquidity cleared = fuel for LONG
+                        score_delta += EQL_SWEPT_BONUS
+                        reasons.append(f"💧 EQH swept @ {eqh['level']:.4f} — liq cleared (+{EQL_SWEPT_BONUS}pts)")
+                    else:
+                        # Not yet swept — price likely hunts it first
+                        if EQL_UNSWEPT_BLOCK:
+                            hard_block = True
+                            reasons.append(f"🚫 Unswept EQH @ {eqh['level']:.4f} above OB — longs blocked")
+                        else:
+                            score_delta -= 8
+                            reasons.append(f"⚠️ Unswept EQH @ {eqh['level']:.4f} — liquidity magnet (-8pts)")
+                    break  # only check nearest EQH
+
+            # EQL below OB — if swept = no more stops below = clean move up
+            for eql in eql_list:
+                if eql['level'] < ob['bottom'] and eql['swept']:
+                    score_delta += EQL_SWEPT_BONUS
+                    reasons.append(f"💧 EQL swept @ {eql['level']:.4f} below OB — clean (+{EQL_SWEPT_BONUS}pts)")
+                    break
+
+        else:  # SHORT
+            # EQL below OB
+            for eql in eql_list:
+                if eql['level'] < ob['bottom']:
+                    if eql['swept']:
+                        score_delta += EQL_SWEPT_BONUS
+                        reasons.append(f"💧 EQL swept @ {eql['level']:.4f} — liq cleared (+{EQL_SWEPT_BONUS}pts)")
+                    else:
+                        if EQL_UNSWEPT_BLOCK:
+                            hard_block = True
+                            reasons.append(f"🚫 Unswept EQL @ {eql['level']:.4f} below OB — shorts blocked")
+                        else:
+                            score_delta -= 8
+                            reasons.append(f"⚠️ Unswept EQL @ {eql['level']:.4f} — liquidity magnet (-8pts)")
+                    break
+
+            # EQH above OB — if swept = clean drop
+            for eqh in eqh_list:
+                if eqh['level'] > ob['top'] and eqh['swept']:
+                    score_delta += EQL_SWEPT_BONUS
+                    reasons.append(f"💧 EQH swept @ {eqh['level']:.4f} above OB — clean (+{EQL_SWEPT_BONUS}pts)")
+                    break
+
+        # ── Strong / Weak Level Check ──────────────────────────
+        strong_highs, weak_highs, strong_lows, weak_lows = \
+            self.classify_swing_levels(df, highs, lows)
+
+        if direction == 'LONG':
+            # Weak high directly above OB = danger (liquidity target)
+            for wh in weak_highs:
+                if ob['top'] < wh['price'] < ob['top'] * (1 + WEAK_LEVEL_WINDOW * 0.002):
+                    score_delta -= WEAK_LEVEL_PENALTY
+                    reasons.append(f"⚠️ Weak High @ {wh['price']:.4f} above OB — stop hunt risk (-{WEAK_LEVEL_PENALTY}pts)")
+                    break
+
+            # Strong low below entry = solid support floor
+            for sl in strong_lows:
+                if sl['price'] < ob['bottom']:
+                    score_delta += STRONG_LEVEL_BONUS
+                    reasons.append(f"🏔️ Strong Low @ {sl['price']:.4f} below OB — structure support (+{STRONG_LEVEL_BONUS}pts)")
+                    break
+
+        else:  # SHORT
+            # Weak low directly below OB = danger
+            for wl in weak_lows:
+                if ob['bottom'] * (1 - WEAK_LEVEL_WINDOW * 0.002) < wl['price'] < ob['bottom']:
+                    score_delta -= WEAK_LEVEL_PENALTY
+                    reasons.append(f"⚠️ Weak Low @ {wl['price']:.4f} below OB — stop hunt risk (-{WEAK_LEVEL_PENALTY}pts)")
+                    break
+
+            # Strong high above entry = solid resistance ceiling
+            for sh in strong_highs:
+                if sh['price'] > ob['top']:
+                    score_delta += STRONG_LEVEL_BONUS
+                    reasons.append(f"🏔️ Strong High @ {sh['price']:.4f} above OB — structure resistance (+{STRONG_LEVEL_BONUS}pts)")
+                    break
+
+        return score_delta, hard_block, reasons
+
     def detect_trigger_candle(self, df, direction):
         """Check last 2 candles for trigger patterns. Returns (label, strength)"""
         l1 = df.iloc[-1]
@@ -399,7 +682,7 @@ class SMCEngine:
 
 
 # ══════════════════════════════════════════════════════════════════
-#  BTC FULL SMC ANALYSER  ← THE CORE UPGRADE IN v4.2
+#  BTC FULL SMC ANALYSER  ← THE CORE UPGRADE IN v4.3
 # ══════════════════════════════════════════════════════════════════
 
 class BTCAnalyser:
@@ -699,7 +982,8 @@ def regime_emoji(regime: str) -> str:
 
 def score_setup(direction, ob, structure, sweep, fvg_near,
                 df_1h, df_15m, df_4h, pd_label, hh_ll_confirmed,
-                btc_delta=0, btc_reasons=None):
+                btc_delta=0, btc_reasons=None,
+                liq_delta=0, liq_reasons=None):
     score   = 0
     reasons = []
     failed  = []
@@ -818,11 +1102,18 @@ def score_setup(direction, ob, structure, sweep, fvg_near,
 
     score += min(extras, 10)
 
-    # ── 8. BTC Full SMC Context (up to ±18 pts) ← UPGRADED ───────
+    # ── 8. BTC Full SMC Context (up to ±18 pts) ──────────────────
     if btc_delta != 0 or btc_reasons:
         score += btc_delta
         if btc_reasons:
             reasons.extend([f"  ↳ {r}" for r in btc_reasons])
+
+    # ── 9. Liquidity Awareness: EQH/EQL + Strong/Weak (v4.3) ─────
+    if liq_delta != 0 or liq_reasons:
+        score += liq_delta
+        if liq_reasons:
+            for r in liq_reasons:
+                reasons.append(r)
 
     return max(0, min(int(score), 100)), reasons, failed
 
@@ -981,12 +1272,12 @@ class SMCProScanner:
             else:
                 debug['gates'].append('⚠️ No recent BOS/MSS (continuing)')
 
-            # Gate 4: 1H Order Block (HARD GATE)
-            obs = self.smc.find_order_blocks(df1, bias, lookback=60)
+            # Gate 4: 1H Order Block — VOLATILITY FILTERED (v4.3)
+            obs = self.smc.find_order_blocks_filtered(df1, bias, lookback=60)
             if not obs:
-                debug['gates'].append(f'❌ No valid {bias} OBs on 1H')
+                debug['gates'].append(f'❌ No valid {bias} OBs on 1H (vol-filtered)')
                 return None, debug
-            debug['gates'].append(f'✅ {len(obs)} OB(s) on 1H')
+            debug['gates'].append(f'✅ {len(obs)} vol-filtered OB(s) on 1H')
 
             active_ob = None
             for ob in obs:
@@ -1017,12 +1308,25 @@ class SMCProScanner:
             if sweep:
                 debug['gates'].append(f'✅ 1H liq sweep @ {sweep["level"]:.5f}')
 
+            # ── v4.3: Liquidity Context (EQH/EQL + Strong/Weak) ──
+            liq_delta, liq_block, liq_reasons = self.smc.check_liquidity_context(
+                df1, bias, active_ob, highs1, lows1
+            )
+            for r in liq_reasons:
+                debug['gates'].append(r)
+            if liq_block:
+                debug['gates'].append(f'🚫 Liquidity hard block — {bias} skipped')
+                return None, debug
+            # ─────────────────────────────────────────────────────
+
             # Score
             score, reasons, failed = score_setup(
                 bias, active_ob, structure, sweep, fvg_near,
                 df1, df15, df4, pd_label, hh_ll_ok,
                 btc_delta=btc_delta,
-                btc_reasons=btc_reasons
+                btc_reasons=btc_reasons,
+                liq_delta=liq_delta,
+                liq_reasons=liq_reasons
             )
             debug['score'] = score
             debug['gates'] += failed
@@ -1094,95 +1398,27 @@ class SMCProScanner:
     # ── Signal Card Formatter ─────────────────────────────────────
 
     def fmt(self, s):
-        arrow  = '🟢' if s['signal'] == 'LONG' else '🔴'
-        icon   = '🚀' if s['signal'] == 'LONG' else '🔻'
-        bar    = '█' * int(s['score']/10) + '░' * (10 - int(s['score']/10))
-        z      = {'DISCOUNT':'🟩 DISCOUNT','PREMIUM':'🟥 PREMIUM','NEUTRAL':'🟨 NEUTRAL'}.get(s['pd_zone'],'')
-        ob     = s['ob']
-        hh_tag = '🏔️ Trending (HH/LL ✅)' if s.get('hh_ll') else '〰️ Ranging (no HH/LL)'
+        icon  = '🚀' if s['signal'] == 'LONG' else '🔻'
+        arrow = '🟢 LONG' if s['signal'] == 'LONG' else '🔴 SHORT'
 
-        # BTC block
-        btc = s.get('btc_ctx') or {}
-        reg = btc.get('regime', 'UNKNOWN')
-        em  = regime_emoji(reg)
+        quality_icon = {'ELITE 👑': '👑', 'PREMIUM 💎': '💎', 'HIGH 🔥': '🔥'}.get(s['quality'], '🔥')
 
-        btc_struct = btc.get('structure')
-        btc_struct_str = btc_struct['kind'] if btc_struct else 'None'
-        btc_ob_str = ''
-        if btc.get('at_bull_ob') and s['signal'] == 'LONG':
-            ob_b = btc.get('ob_bull')
-            btc_ob_str = f"\n  🎯 BTC at bull OB [{ob_b['bottom']:.0f}–{ob_b['top']:.0f}]" if ob_b else "\n  🎯 BTC at bull OB"
-        elif btc.get('at_bear_ob') and s['signal'] == 'SHORT':
-            ob_b = btc.get('ob_bear')
-            btc_ob_str = f"\n  🎯 BTC at bear OB [{ob_b['bottom']:.0f}–{ob_b['top']:.0f}]" if ob_b else "\n  🎯 BTC at bear OB"
+        tp1_pct = abs((s['targets'][0] - s['entry']) / s['entry'] * 100)
+        tp2_pct = abs((s['targets'][1] - s['entry']) / s['entry'] * 100)
+        tp3_pct = abs((s['targets'][2] - s['entry']) / s['entry'] * 100)
 
-        btc_sweep_str = ""
-        if btc.get('sweep'):
-            sw = btc['sweep']
-            btc_sweep_str = f"\n  💧 BTC swept {sw['type']} @ {sw['level']:.0f}"
-
-        btc_trigger_str = ""
-        if btc.get('trigger_label'):
-            btc_trigger_str = f"\n  🕯️ BTC trigger: {btc['trigger_label']}"
-
-        msg  = f"{'━'*40}\n"
-        msg += f"{icon} <b>SMC PRO v4.2 — {s['quality']}</b> {icon}\n"
-        msg += f"{'━'*40}\n\n"
-        msg += f"<b>🆔</b> <code>{s['trade_id']}</code>\n"
-        msg += f"<b>📊 PAIR:</b>   <b>#{s['symbol']}USDT</b>\n"
-        msg += f"<b>📍 DIR:</b>    {arrow} <b>{s['signal']}</b>\n"
-        msg += f"<b>🗺️ ZONE:</b>   {z} ({s['pd_pos']*100:.0f}%)\n"
-        msg += f"<b>📐 4H STR:</b> {hh_tag}\n\n"
-
-        # ── BTC Full SMC Section ───────────────────────────────────
-        msg += f"<b>{'─'*38}</b>\n"
-        msg += f"<b>🟠 BTC KING ANALYSIS</b>\n"
-        msg += f"  {em} Regime:    <b>{reg}</b>\n"
-        msg += f"  📊 Trend:     {btc.get('ema_trend','?')}\n"
-        msg += f"  🏗️ Structure: {btc_struct_str}\n"
-        msg += f"  💰 Price:     ${btc.get('price',0):,.0f}\n"
-        msg += f"  📈 1H move:   {btc.get('1h_chg',0):+.2f}%\n"
-        msg += f"  📈 3H move:   {btc.get('3h_chg',0):+.2f}%\n"
-        msg += f"  🗺️ PD Zone:   {btc.get('pd_zone','?')} ({btc.get('pd_pos',0.5)*100:.0f}%)\n"
-        msg += f"  {'🏔️ HH/LL: YES' if btc.get('hh_ll') else '〰️ HH/LL: NO (ranging)'}\n"
-        msg += btc_ob_str
-        msg += btc_sweep_str
-        msg += btc_trigger_str
-        if s.get('btc_reasons'):
-            for r in s['btc_reasons']:
-                msg += f"\n  • {r}"
-        msg += f"\n<b>{'─'*38}</b>\n\n"
-        # ──────────────────────────────────────────────────────────
-
-        msg += f"<b>⭐ SCORE: {s['score']} / 100</b>\n"
-        msg += f"<code>[{bar}]</code>\n\n"
-        msg += f"<b>📦 ORDER BLOCK (1H):</b>\n"
-        msg += f"  Top:    <code>${ob['top']:.6f}</code>\n"
-        msg += f"  Bottom: <code>${ob['bottom']:.6f}</code>\n"
-        msg += f"  Mid:    <code>${ob['mid']:.6f}</code>\n\n"
-        msg += f"<b>💰 ENTRY NOW:</b> <code>${s['entry']:.6f}</code>\n\n"
-        msg += f"<b>🎯 TARGETS:</b>\n"
-        for (lbl, eta), tp, rr in zip(
-            [('TP1 — 50% exit','6-12h'),('TP2 — 30% exit','12-24h'),('TP3 — 20% exit','24-48h')],
-            s['targets'], s['rr']
-        ):
-            pct = abs((tp - s['entry'])/s['entry']*100)
-            msg += f"  <b>{lbl}</b> [{eta}]\n"
-            msg += f"  <code>${tp:.6f}</code>  <b>+{pct:.2f}%</b>  RR {rr:.1f}:1\n\n"
-        msg += f"<b>🛑 STOP LOSS:</b> <code>${s['stop_loss']:.6f}</code>  (-{s['risk_pct']:.2f}%)\n"
-        msg += f"  └ <i>1H close below OB = invalidated</i>\n\n"
-        if s['structure']:
-            sk  = s['structure']['kind']
-            lbl = '🔄 MSS — Early Reversal' if 'MSS' in sk else '💥 BOS — Pullback Entry'
-            msg += f"<b>🏗️ STRUCTURE:</b> {lbl}\n\n"
-        msg += f"<b>📋 CONFLUENCE:</b>\n"
-        for r in s['reasons'][:15]:
-            msg += f"  • {r}\n"
-        msg += f"\n<b>⚠️ RISK:</b> 1-2% per trade only\n"
-        msg += f"  Move SL → BE after TP1 hits\n"
-        msg += f"\n<b>📡 Live Tracking: ON</b>\n"
-        msg += f"<i>🕐 {s['timestamp'].strftime('%Y-%m-%d %H:%M UTC')}</i>\n"
-        msg += f"{'━'*40}"
+        msg  = f"{'━'*26}\n"
+        msg += f"{icon} <b>{arrow} — #{s['symbol']}USDT</b>\n"
+        msg += f"{'━'*26}\n\n"
+        msg += f"{quality_icon} <b>Score: {s['score']}/100</b>\n\n"
+        msg += f"💰 <b>Entry:</b>  <code>${s['entry']:.4f}</code>\n\n"
+        msg += f"🎯 <b>TP1:</b>    <code>${s['targets'][0]:.4f}</code>  <b>(+{tp1_pct:.1f}%)</b>\n"
+        msg += f"🎯 <b>TP2:</b>    <code>${s['targets'][1]:.4f}</code>  <b>(+{tp2_pct:.1f}%)</b>\n"
+        msg += f"🎯 <b>TP3:</b>    <code>${s['targets'][2]:.4f}</code>  <b>(+{tp3_pct:.1f}%)</b>\n\n"
+        msg += f"🛑 <b>Stop:</b>   <code>${s['stop_loss']:.4f}</code>  <b>(-{s['risk_pct']:.1f}%)</b>\n\n"
+        msg += f"📊 <b>RR →</b>  1:{s['rr'][0]:.1f}  /  1:{s['rr'][1]:.1f}  /  1:{s['rr'][2]:.1f}\n\n"
+        msg += f"⚠️ <i>Risk 1-2% max — move SL to BE after TP1</i>\n"
+        msg += f"{'━'*26}"
         return msg
 
     # ── Telegram Sender ───────────────────────────────────────────
@@ -1289,7 +1525,7 @@ class SMCProScanner:
             btc_header = "⚪ BTC: data unavailable — filter skipped"
 
         await self.send(
-            f"🔍 <b>SMC v4.2 SCAN STARTED</b>\n\n"
+            f"🔍 <b>SMC v4.3 SCAN STARTED</b>\n\n"
             f"{btc_header}\n\n"
             f"Stack: BTC SMC → 4H trend → 1H OB + structure + trigger → 15M vol\n"
             f"Min score: {MIN_SCORE} | OB tol: {OB_TOLERANCE_PCT*100:.1f}%\n"
@@ -1328,6 +1564,16 @@ class SMCProScanner:
         self.last_debug = near_misses[:10]
 
         for sig in top:
+            # ── v4.3 Duplicate Filter ─────────────────────────────
+            # Skip if same symbol + same direction already active
+            already_active = any(
+                t['symbol'] == sig['symbol'] and t['signal'] == sig['signal']
+                for t in self.active_trades.values()
+            )
+            if already_active:
+                logger.info(f"⏭️ Skipping duplicate: {sig['symbol']} {sig['signal']} already active")
+                continue
+            # ─────────────────────────────────────────────────────
             self.signal_history.append(sig)
             self.active_trades[sig['trade_id']] = sig
             self.stats['total'] += 1
@@ -1347,7 +1593,7 @@ class SMCProScanner:
         lg = sum(1 for s in top if s['signal'] == 'LONG')
         tr = sum(1 for s in top if s.get('hh_ll'))
 
-        summ  = f"✅ <b>SCAN COMPLETE — v4.2</b>\n\n"
+        summ  = f"✅ <b>SCAN COMPLETE — v4.3</b>\n\n"
         if btc_ctx:
             summ += f"🟠 BTC: {btc_ctx['regime']} | {btc_ctx['1h_chg']:+.2f}% (1H)\n"
         summ += f"📊 Pairs scanned:  {scanned}\n"
@@ -1369,23 +1615,21 @@ class SMCProScanner:
         return top
 
     async def run(self, interval_min=SCAN_INTERVAL_MIN):
-        logger.info("🚀 SMC Pro v4.2 starting")
+        logger.info("🚀 SMC Pro v4.3 starting")
         await self.send(
-            "👑 <b>SMC PRO v4.2 — FULL BTC SMC ENGINE</b> 👑\n\n"
+            "👑 <b>SMC PRO v4.3 — LIQUIDITY AWARENESS</b> 👑\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>BTC Full SMC  →  4H Trend  →  1H OB+Structure+Trigger  →  15M Vol</b>\n\n"
-            "BTC now gets the full treatment:\n"
-            "  ✅ 4H EMA + HH/LL + PD zone\n"
-            "  ✅ 1H BOS/MSS structure\n"
-            "  ✅ 1H Order Block (both directions)\n"
-            "  ✅ 1H Liquidity Sweep\n"
-            "  ✅ 1H Fair Value Gap\n"
-            "  ✅ 1H Trigger candle\n"
-            "  ✅ 15M volume spike\n\n"
-            "BTC Regimes:\n"
-            "  🟢🟢 BULL_CONFIRMED   🟢 BULL_STRUCTURE   🟡🟢 BULL_RANGING\n"
-            "  🔴🔴 BEAR_CONFIRMED   🔴 BEAR_STRUCTURE   🟡🔴 BEAR_RANGING\n"
-            "  🔄🟢 REVERSAL_BULL    🔄🔴 REVERSAL_BEAR   🟡 RANGING\n\n"
+            "<b>BTC Full SMC  →  4H Trend  →  1H OB+Structure+Trigger  →  Liq Check  →  15M Vol</b>\n\n"
+            "v4.3 NEW — Liquidity Awareness Engine:\n"
+            "  ✅ Equal Highs/Lows (EQH/EQL) detection\n"
+            "  ✅ Unswept EQH above LONG → blocked\n"
+            "  ✅ Swept EQH/EQL → +6pts bonus (fuel confirmed)\n"
+            "  ✅ Weak High above OB → -6pts (stop hunt risk)\n"
+            "  ✅ Strong Low below OB → +5pts (structure floor)\n"
+            "  ✅ Volatility OB filter (news spike candles excluded)\n\n"
+            "Full stack:\n"
+            "  BTC SMC → 4H trend → 1H structure → Vol-filtered OB\n"
+            "  → EQH/EQL check → Strong/Weak levels → Trigger → Score\n\n"
             f"Min score: {MIN_SCORE} | Scan: every {SCAN_INTERVAL_MIN}min\n\n"
             "Commands: /scan /btc /stats /trades /debug /help\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -1413,7 +1657,7 @@ class Commands:
 
     async def start(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(
-            "👑 <b>SMC Pro v4.2 — Full BTC SMC Engine</b>\n\n"
+            "👑 <b>SMC Pro v4.3 — Full BTC SMC Engine</b>\n\n"
             "BTC is now fully analysed with the same SMC stack as every alt:\n"
             "regime, structure, OB, sweep, FVG, trigger candle.\n\n"
             "Stack: BTC Full SMC → 4H trend → 1H OB+structure+trigger → 15M vol\n\n"
@@ -1458,7 +1702,7 @@ class Commands:
         long_impact  = "🚫 HARD BLOCKED" if blk_long  else f"{'+' if d_long>=0 else ''}{d_long}pts"
         short_impact = "🚫 HARD BLOCKED" if blk_short else f"{'+' if d_short>=0 else ''}{d_short}pts"
 
-        msg  = f"🟠 <b>BTC FULL SMC ANALYSIS v4.2</b>\n"
+        msg  = f"🟠 <b>BTC FULL SMC ANALYSIS v4.3</b>\n"
         msg += f"{'━'*38}\n\n"
         msg += f"<b>💰 Price:</b>  <code>${ctx['price']:,.2f}</code>\n"
         msg += f"<b>🏷️ Regime:</b> {em} <b>{ctx['regime']}</b>\n"
@@ -1498,7 +1742,7 @@ class Commands:
 
     async def stats(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         s = self.s.stats
-        msg  = "📊 <b>SMC PRO v4.2 STATS</b>\n\n"
+        msg  = "📊 <b>SMC PRO v4.3 STATS</b>\n\n"
         msg += f"Total signals: {s['total']}\n"
         msg += f"  👑 Elite: {s['elite']}  💎 Premium: {s['premium']}  🔥 High: {s['high']}\n"
         msg += f"  🟢 Long: {s['long']}  🔴 Short: {s['short']}\n\n"
@@ -1540,49 +1784,42 @@ class Commands:
         await u.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
     async def help(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        msg  = "📚 <b>SMC PRO v4.2 — FULL STRATEGY</b>\n\n"
+        msg  = "📚 <b>SMC PRO v4.3 — FULL STRATEGY</b>\n\n"
         msg += "<b>Scan Stack (in order):</b>\n"
-        msg += "  0️⃣ BTC Full SMC  ← upgraded gate\n"
+        msg += "  0️⃣ BTC Full SMC  (regime + hard blocks)\n"
         msg += "  1️⃣ ALT 4H EMA bias\n"
         msg += "  2️⃣ PD zone filter\n"
         msg += "  3️⃣ ALT 1H BOS/MSS\n"
-        msg += "  4️⃣ ALT 1H Order Block\n"
-        msg += f"  5️⃣ Score ≥ {MIN_SCORE}/100\n\n"
+        msg += "  4️⃣ ALT 1H Order Block (volatility filtered) ← v4.3\n"
+        msg += "  5️⃣ EQH/EQL liquidity check ← v4.3\n"
+        msg += f"  6️⃣ Score ≥ {MIN_SCORE}/100\n\n"
+        msg += "<b>v4.3 Liquidity Awareness:</b>\n"
+        msg += f"  🚫 Unswept EQH above LONG OB → hard block\n"
+        msg += f"  🚫 Unswept EQL below SHORT OB → hard block\n"
+        msg += f"  💧 EQH/EQL already swept → +{EQL_SWEPT_BONUS}pts (fuel)\n"
+        msg += f"  ⚠️ Weak High in LONG path → -{WEAK_LEVEL_PENALTY}pts\n"
+        msg += f"  ⚠️ Weak Low in SHORT path → -{WEAK_LEVEL_PENALTY}pts\n"
+        msg += f"  🏔️ Strong Low supports LONG → +{STRONG_LEVEL_BONUS}pts\n"
+        msg += f"  🏔️ Strong High resists SHORT → +{STRONG_LEVEL_BONUS}pts\n"
+        msg += f"  🔇 News spike candles excluded from OB detection\n\n"
         msg += "<b>BTC Regimes:</b>\n"
-        msg += "  🟢🟢 BULL_CONFIRMED  = trend+structure+trigger\n"
-        msg += "  🟢   BULL_STRUCTURE  = trend+structure (no trigger)\n"
-        msg += "  🟡🟢 BULL_RANGING    = trend only\n"
-        msg += "  🔴🔴 BEAR_CONFIRMED  = trend+structure+trigger\n"
-        msg += "  🔴   BEAR_STRUCTURE  = trend+structure\n"
-        msg += "  🟡🔴 BEAR_RANGING    = trend only\n"
-        msg += "  🔄🟢 REVERSAL_BULL   = bear trend BUT bull MSS\n"
-        msg += "  🔄🔴 REVERSAL_BEAR   = bull trend BUT bear MSS\n"
-        msg += "  🟡   RANGING         = no clear bias\n\n"
-        msg += "<b>Hard Blocks:</b>\n"
-        msg += "  BEAR_CONFIRMED + LONGs → blocked\n"
-        msg += "  BULL_CONFIRMED + SHORTs → blocked\n"
-        msg += "  REVERSAL_BEAR forming → LONGs blocked\n"
-        msg += "  REVERSAL_BULL forming → SHORTs blocked\n"
-        msg += f"  Flash move >{BTC_HARD_BLOCK_1H_PCT}% (1H) → opposite blocked\n\n"
-        msg += "<b>Score System (max ~100):</b>\n"
+        msg += "  🟢🟢 BULL_CONFIRMED  🟢 BULL_STRUCTURE  🟡🟢 BULL_RANGING\n"
+        msg += "  🔴🔴 BEAR_CONFIRMED  🔴 BEAR_STRUCTURE  🟡🔴 BEAR_RANGING\n"
+        msg += "  🔄🟢 REVERSAL_BULL   🔄🔴 REVERSAL_BEAR  🟡 RANGING\n\n"
+        msg += "<b>Score System:</b>\n"
         msg += "  +25 — 1H trigger candle\n"
         msg += "  +20 — MSS structure\n"
-        msg += "  +20 — Tight OB\n"
+        msg += "  +20 — Tight OB (vol-filtered)\n"
         msg += "  +15 — 4H triple EMA\n"
-        msg += f"  +15 — BTC BULL/BEAR_CONFIRMED\n"
+        msg += f"  +15 — BTC CONFIRMED regime\n"
         msg += f"  +{HH_LL_BONUS}  — 4H HH/LL\n"
-        msg += f"  +{BTC_OB_BONUS}  — BTC at own OB\n"
-        msg += f"  +{BTC_SWEEP_BONUS}  — BTC liq sweep\n"
-        msg += f"  +{BTC_FVG_BONUS}  — BTC FVG\n"
+        msg += f"  +{EQL_SWEPT_BONUS}  — EQH/EQL swept (fuel) ← v4.3\n"
+        msg += f"  +{STRONG_LEVEL_BONUS}  — Strong level support ← v4.3\n"
+        msg += f"  -{WEAK_LEVEL_PENALTY}  — Weak level in path ← v4.3\n"
         msg += "  +12 — Momentum\n"
-        msg += "  +10 — Extras\n"
-        msg += "  -18 — BTC strongly opposing\n\n"
+        msg += "  +10 — Extras\n\n"
         msg += "<b>Commands:</b>\n"
-        msg += "  /btc    — Full BTC SMC snapshot\n"
-        msg += "  /scan   — Manual scan\n"
-        msg += "  /stats  — Stats\n"
-        msg += "  /trades — Active trades\n"
-        msg += "  /debug  — Near misses\n"
+        msg += "  /btc    /scan    /stats    /trades    /debug"
         await u.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 
@@ -1618,7 +1855,7 @@ async def main():
 
     await app.initialize()
     await app.start()
-    logger.info("🤖 SMC Pro v4.2 ready!")
+    logger.info("🤖 SMC Pro v4.3 ready!")
 
     try:
         await scanner.run(interval_min=SCAN_INTERVAL_MIN)
