@@ -37,7 +37,7 @@ MIN_VOLUME_24H        = 5_000_000
 OB_TOLERANCE_PCT      = 0.008
 OB_IMPULSE_ATR_MULT   = 1.0
 STRUCTURE_LOOKBACK    = 20
-SCAN_INTERVAL_MIN     = 30
+SCAN_INTERVAL_MIN     = 60
 HH_LL_LOOKBACK        = 10
 HH_LL_BONUS           = 8
 DUPLICATE_COOLDOWN_H  = 4   # hours before same symbol+direction can re-fire
@@ -1036,8 +1036,8 @@ class Commands:
 
 async def main():
     # ════════════ CONFIG ════════════
-    TELEGRAM_TOKEN   = "8034062612:AAEJYbPA8sMODYvqvt8U-5mM7c3Y3-GOYtM"
-    TELEGRAM_CHAT_ID = "7500072234"
+    TELEGRAM_TOKEN   = "7957028587:AAE7aSYtE4hCxxTIPkAs_1ULJ9e8alkY6Ic"
+    TELEGRAM_CHAT_ID = "-1002442074724"
     BINANCE_API_KEY  = None
     BINANCE_SECRET   = None
     # ════════════════════════════════
@@ -1075,3 +1075,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
