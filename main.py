@@ -12,11 +12,24 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════
-#  BACKTESTER V2 — validates all 5 strategy improvements
-#  Run this to get the before/after comparison report
+#  BACKTESTER V3 — Balanced settings (not too strict, not loose)
+#
+#  V1 → V2 was too aggressive, filtered everything to zero.
+#  V3 finds the sweet spot:
+#
+#  Score threshold : 51% → 55%   (was 60% in V2 — too strict)
+#  ATR cap         : none → 3%   (was 2% in V2 — too strict)
+#  Volume filter   : $1M → $5M   (was $10M in V2 — too strict)
+#  BTC regime      : hard block → SOFT BIAS
+#                    BULL  → longs get +2 bonus pts, shorts get -2
+#                    BEAR  → shorts get +2 bonus pts, longs get -2
+#                    NEUTRAL → no change
+#                    (replaces full block — still filters but doesn't zero out)
+#  SL multiplier   : 1.5x → 1.2x (was 1.0x in V2 — slightly too tight)
+#  TP multipliers  : [1.0,2.0,3.5] → [1.0,2.0,3.2]
 # ═══════════════════════════════════════════════════════════════
 
-class BacktesterV2:
+class BacktesterV3:
 
     def __init__(self, binance_api_key=None, binance_secret=None,
                  telegram_token=None, telegram_chat_id=None):
@@ -29,25 +42,25 @@ class BacktesterV2:
         self.telegram_token = telegram_token
         self.chat_id        = telegram_chat_id
 
-        # ── V2 params (all fixes applied) ────────────────────
+        # ── V3 Balanced params ────────────────────────────────
         self.LOOKBACK_DAYS    = 60
         self.TOP_N_PAIRS      = 30
-        self.MIN_VOLUME_USDT  = 10_000_000  # FIX 3: was 5M
-        self.ATR_SL_MULT      = 1.0         # FIX 5: was 1.5
-        self.ATR_TP_MULTS     = [0.8, 1.8, 3.0]  # FIX 5: was [1.0, 2.0, 3.5]
-        self.ATR_PCT_CAP      = 0.02        # FIX 1: skip if ATR > 2% of price
-        self.SCORE_THRESHOLD  = 0.60        # FIX 2: was 0.51
+        self.MIN_VOLUME_USDT  = 5_000_000   # V3: $5M (V1=$1M, V2=$10M)
+        self.ATR_SL_MULT      = 1.2         # V3: 1.2x (V1=1.5x, V2=1.0x)
+        self.ATR_TP_MULTS     = [1.0, 2.0, 3.2]  # V3 (V1=[1.0,2.0,3.5])
+        self.ATR_PCT_CAP      = 0.03        # V3: 3% (V2=2%)
+        self.SCORE_THRESHOLD  = 0.55        # V3: 55% (V1=51%, V2=60%)
+        self.REGIME_BIAS_PTS  = 2.0         # bonus/penalty points for regime
         self.MAX_HOLD_HOURS   = 24
         self.COMMISSION_PCT   = 0.04
         # ─────────────────────────────────────────────────────
 
-        self.btc_df_4h = None  # FIX 4: BTC regime data
+        self.btc_df_4h = None
 
     # ─────────────────────────────────────────────────────────
-    #  FIX 4 — BTC regime lookup at any timestamp
+    #  BTC regime — SOFT BIAS (not hard block)
     # ─────────────────────────────────────────────────────────
     def _get_btc_regime_at(self, ts):
-        """Returns 'BULL', 'BEAR', or 'NEUTRAL' for a given timestamp."""
         if self.btc_df_4h is None or len(self.btc_df_4h) == 0:
             return 'NEUTRAL'
         past = self.btc_df_4h[self.btc_df_4h['timestamp'] <= ts]
@@ -71,17 +84,14 @@ class BacktesterV2:
             atr = ta.volatility.AverageTrueRange(
                 df['high'], df['low'], df['close'], window=period
             ).average_true_range()
-            upper_band = hl2 + (multiplier * atr)
-            lower_band = hl2 - (multiplier * atr)
-            supertrend = [0.0] * len(df)
+            upper = hl2 + (multiplier * atr)
+            lower = hl2 - (multiplier * atr)
+            st = [0.0] * len(df)
             for i in range(1, len(df)):
-                if df['close'].iloc[i] > upper_band.iloc[i-1]:
-                    supertrend[i] = lower_band.iloc[i]
-                elif df['close'].iloc[i] < lower_band.iloc[i-1]:
-                    supertrend[i] = upper_band.iloc[i]
-                else:
-                    supertrend[i] = supertrend[i-1]
-            return pd.Series(supertrend, index=df.index)
+                if df['close'].iloc[i] > upper.iloc[i-1]:   st[i] = lower.iloc[i]
+                elif df['close'].iloc[i] < lower.iloc[i-1]: st[i] = upper.iloc[i]
+                else:                                         st[i] = st[i-1]
+            return pd.Series(st, index=df.index)
         except:
             return pd.Series([0.0] * len(df), index=df.index)
 
@@ -103,7 +113,7 @@ class BacktesterV2:
             df['macd']        = macd.macd()
             df['macd_signal'] = macd.macd_signal()
             df['macd_hist']   = macd.macd_diff()
-            df['williams_r'] = ta.momentum.WilliamsRIndicator(
+            df['williams_r']  = ta.momentum.WilliamsRIndicator(
                 df['high'], df['low'], df['close']
             ).williams_r()
             df['roc'] = ta.momentum.ROCIndicator(df['close'], window=12).roc()
@@ -167,7 +177,7 @@ class BacktesterV2:
         return df
 
     # ─────────────────────────────────────────────────────────
-    #  Signal detection — V2 with all fixes
+    #  Signal detection — V3 with soft regime bias
     # ─────────────────────────────────────────────────────────
     def _detect_signal_at(self, df_1h_slice, df_4h_slice, df_15m_slice, ts):
         try:
@@ -189,7 +199,7 @@ class BacktesterV2:
                 if c not in lat1.index or pd.isna(lat1[c]):
                     return None
 
-            # FIX 1: Hard ATR cap
+            # ATR cap — V3 = 3% (was 2% in V2)
             atr_pct = lat1['atr'] / lat1['close']
             if atr_pct > self.ATR_PCT_CAP:
                 return None
@@ -201,15 +211,15 @@ class BacktesterV2:
             ls = ss = 0.0
             max_score = 35
 
-            # TREND
-            if lat4['ema_9'] > lat4['ema_21'] > lat4['ema_50']: ls += 3
+            # ── TREND (6) ────────────────────────────────────
+            if lat4['ema_9'] > lat4['ema_21'] > lat4['ema_50']:   ls += 3
             elif lat4['ema_9'] < lat4['ema_21'] < lat4['ema_50']: ss += 3
-            if lat1['ema_9'] > lat1['ema_21']: ls += 2
+            if lat1['ema_9'] > lat1['ema_21']:   ls += 2
             elif lat1['ema_9'] < lat1['ema_21']: ss += 2
-            if lat1['close'] > lat1['supertrend']: ls += 1
+            if lat1['close'] > lat1['supertrend']:   ls += 1
             elif lat1['close'] < lat1['supertrend']: ss += 1
 
-            # MOMENTUM
+            # ── MOMENTUM (9) ─────────────────────────────────
             rsi = lat1['rsi']
             if rsi < 30:    ls += 3.5
             elif rsi < 40:  ls += 2
@@ -224,7 +234,7 @@ class BacktesterV2:
             if lat1['uo'] < 30:  ls += 1.5
             elif lat1['uo'] > 70: ss += 1.5
 
-            # VOLUME
+            # ── VOLUME (5) ───────────────────────────────────
             if vol_spike:
                 if lat1['close'] > prev1['close']: ls += 3
                 else:                               ss += 3
@@ -236,7 +246,7 @@ class BacktesterV2:
             if obv_trend > 0 and lat1['obv'] > lat1['obv_ema']:   ls += 0.5
             elif obv_trend < 0 and lat1['obv'] < lat1['obv_ema']: ss += 0.5
 
-            # VOLATILITY
+            # ── VOLATILITY (6) ───────────────────────────────
             if lat1['bb_pband'] < 0.1:   ls += 2.5
             elif lat1['bb_pband'] > 0.9:  ss += 2.5
             if lat1['cci'] < -150:  ls += 1.5
@@ -246,7 +256,7 @@ class BacktesterV2:
             if lat1['close'] < lat1['vwap'] * 0.98:   ls += 1
             elif lat1['close'] > lat1['vwap'] * 1.02:  ss += 1
 
-            # TREND STRENGTH
+            # ── TREND STRENGTH (4) ───────────────────────────
             if lat1['adx'] > 30:
                 if lat1['di_plus'] > lat1['di_minus']: ls += 2
                 else:                                   ss += 2
@@ -258,45 +268,57 @@ class BacktesterV2:
             if lat1['roc'] > 3:  ls += 1
             elif lat1['roc'] < -3: ss += 1
 
-            # PATTERNS
+            # ── PATTERNS & DIVERGENCE (3) ────────────────────
             if lat1['bullish_divergence'] == 1:  ls += 2
             elif lat1['bearish_divergence'] == 1: ss += 2
             if lat15['bullish_engulfing'] == 1:  ls += 1.5
             elif lat15['bearish_engulfing'] == 1: ss += 1.5
 
-            # HTF
+            # ── HTF (2) ──────────────────────────────────────
             if lat4['close'] > lat4['vwap']: ls += 1
             else:                             ss += 1
             if lat4['rsi'] < 50:  ls += 1
             elif lat4['rsi'] > 50: ss += 1
 
-            # FIX 2: Raised threshold
+            # ── SOFT REGIME BIAS (V3 key change) ─────────────
+            # Instead of hard blocking, we nudge scores by 2 pts
+            # This makes counter-trend signals need to be STRONGER
+            # to pass the threshold, but doesn't zero them out
+            regime = self._get_btc_regime_at(ts)
+            if regime == 'BULL':
+                ls += self.REGIME_BIAS_PTS    # reward longs in bull
+                ss -= self.REGIME_BIAS_PTS    # penalise shorts in bull
+            elif regime == 'BEAR':
+                ss += self.REGIME_BIAS_PTS    # reward shorts in bear
+                ls -= self.REGIME_BIAS_PTS    # penalise longs in bear
+            # NEUTRAL → no adjustment
+
+            # Clamp to zero (can't go negative)
+            ls = max(ls, 0)
+            ss = max(ss, 0)
+
+            # ── Threshold — V3 = 55% ─────────────────────────
             threshold = max_score * self.SCORE_THRESHOLD
             signal = quality = None
 
             if ls > ss and ls >= threshold:
                 signal = 'LONG';  score = ls
-                if ls >= max_score * 0.71:   quality = 'PREMIUM'
-                elif ls >= max_score * 0.60: quality = 'HIGH'
-                else:                        quality = 'GOOD'
+                if ls >= max_score * 0.71:    quality = 'PREMIUM'
+                elif ls >= max_score * 0.60:  quality = 'HIGH'
+                else:                         quality = 'GOOD'
             elif ss > ls and ss >= threshold:
                 signal = 'SHORT'; score = ss
-                if ss >= max_score * 0.71:   quality = 'PREMIUM'
-                elif ss >= max_score * 0.60: quality = 'HIGH'
-                else:                        quality = 'GOOD'
+                if ss >= max_score * 0.71:    quality = 'PREMIUM'
+                elif ss >= max_score * 0.60:  quality = 'HIGH'
+                else:                         quality = 'GOOD'
 
             if not signal:
                 return None
 
-            # FIX 4: BTC regime gate
-            regime = self._get_btc_regime_at(ts)
-            if regime == 'BEAR'  and signal == 'LONG':  return None
-            if regime == 'BULL'  and signal == 'SHORT': return None
-
             entry = lat15['close']
             atr   = lat1['atr']
 
-            # FIX 5: Tighter SL + proportional TPs
+            # SL = 1.2x ATR, TPs = 1.0/2.0/3.2x ATR
             if signal == 'LONG':
                 sl  = entry - atr * self.ATR_SL_MULT
                 tps = [entry + atr * m for m in self.ATR_TP_MULTS]
@@ -321,16 +343,15 @@ class BacktesterV2:
     #  Trade simulation
     # ─────────────────────────────────────────────────────────
     def _simulate_trade(self, signal, future_candles):
-        entry  = signal['entry']
-        sl     = signal['sl']
-        tps    = signal['tps']
+        entry = signal['entry']
+        sl    = signal['sl']
+        tps   = signal['tps']
         direction = signal['signal']
 
         tp_hit = [False, False, False]
         sl_hit = False
-        exit_price  = None
-        exit_reason = None
-        hours_held  = 0
+        exit_price = exit_reason = None
+        hours_held = 0
 
         for _, row in future_candles.iterrows():
             hours_held += 1
@@ -340,16 +361,14 @@ class BacktesterV2:
                 if lo <= sl:
                     sl_hit = True; exit_price = sl; exit_reason = 'SL'; break
                 for j, tp in enumerate(tps):
-                    if not tp_hit[j] and hi >= tp:
-                        tp_hit[j] = True
+                    if not tp_hit[j] and hi >= tp: tp_hit[j] = True
                 if tp_hit[2]:
                     exit_price = tps[2]; exit_reason = 'TP3'; break
             else:
                 if hi >= sl:
                     sl_hit = True; exit_price = sl; exit_reason = 'SL'; break
                 for j, tp in enumerate(tps):
-                    if not tp_hit[j] and lo <= tp:
-                        tp_hit[j] = True
+                    if not tp_hit[j] and lo <= tp: tp_hit[j] = True
                 if tp_hit[2]:
                     exit_price = tps[2]; exit_reason = 'TP3'; break
 
@@ -373,8 +392,7 @@ class BacktesterV2:
         else:
             for j in range(3):
                 if tp_hit[j]:
-                    raw = abs(tps[j] - entry) / entry * 100
-                    pnl_pct += raw * weights[j]
+                    pnl_pct += abs(tps[j] - entry) / entry * 100 * weights[j]
             filled = sum(weights[:tp_reached]) if tp_reached else 0
             remaining = 1.0 - filled
             if remaining > 0:
@@ -393,7 +411,7 @@ class BacktesterV2:
         }
 
     # ─────────────────────────────────────────────────────────
-    #  Walk-forward engine
+    #  Walk-forward
     # ─────────────────────────────────────────────────────────
     def _walk_forward(self, symbol, df_1h, df_4h, df_15m):
         trades = []
@@ -437,9 +455,12 @@ class BacktesterV2:
             trades.append(trade)
             open_trade_until = ts + timedelta(hours=outcome['hours_held'])
 
-            logger.info(f"  📊 {trade['symbol']} {trade['signal']} {trade['signal_time']} "
-                        f"[{trade['regime']}] [ATR {trade['atr_pct']:.1f}%] "
-                        f"→ {trade['exit_reason']} {trade['pnl_pct']:+.2f}%")
+            logger.info(
+                f"  📊 {trade['symbol']:12s} {trade['signal']:5s} "
+                f"[{trade['regime']:7s}] [ATR {trade['atr_pct']:.1f}%] "
+                f"[Score {trade['score_pct']:.0f}%] "
+                f"{trade['signal_time']} → {trade['exit_reason']:10s} {trade['pnl_pct']:+.2f}%"
+            )
         return trades
 
     # ─────────────────────────────────────────────────────────
@@ -476,7 +497,9 @@ class BacktesterV2:
                     if t.get('quoteVolume', 0) > self.MIN_VOLUME_USDT:
                         pairs.append((sym, t['quoteVolume']))
             pairs.sort(key=lambda x: x[1], reverse=True)
-            return [p[0] for p in pairs[:self.TOP_N_PAIRS]]
+            selected = [p[0] for p in pairs[:self.TOP_N_PAIRS]]
+            logger.info(f"✅ {len(selected)} pairs ≥ ${self.MIN_VOLUME_USDT/1e6:.0f}M volume")
+            return selected
         except Exception as e:
             logger.error(f"Get pairs: {e}")
             return []
@@ -496,6 +519,7 @@ class BacktesterV2:
         avg_loss = df[~df['win']]['pnl_pct'].mean() if losses > 0 else 0
         rr       = abs(avg_win / avg_loss) if avg_loss != 0 else 0
         expectancy = (wr/100 * avg_win) + ((1 - wr/100) * avg_loss)
+
         tp1_rate = df['tp_hit'].apply(lambda x: x[0]).mean() * 100
         tp2_rate = df['tp_hit'].apply(lambda x: x[1]).mean() * 100
         tp3_rate = df['tp_hit'].apply(lambda x: x[2]).mean() * 100
@@ -504,7 +528,7 @@ class BacktesterV2:
         quality_stats = {}
         for q in ['PREMIUM', 'HIGH', 'GOOD']:
             sub = df[df['quality'] == q]
-            if len(sub) > 0:
+            if len(sub):
                 quality_stats[q] = {
                     'count': len(sub),
                     'wr': round(sub['win'].mean() * 100, 1),
@@ -514,8 +538,18 @@ class BacktesterV2:
         dir_stats = {}
         for d in ['LONG', 'SHORT']:
             sub = df[df['signal'] == d]
-            if len(sub) > 0:
+            if len(sub):
                 dir_stats[d] = {
+                    'count': len(sub),
+                    'wr': round(sub['win'].mean() * 100, 1),
+                    'avg_pnl': round(sub['pnl_pct'].mean(), 2)
+                }
+
+        regime_stats = {}
+        for r in ['BULL', 'BEAR', 'NEUTRAL']:
+            sub = df[df['regime'] == r]
+            if len(sub):
+                regime_stats[r] = {
                     'count': len(sub),
                     'wr': round(sub['win'].mean() * 100, 1),
                     'avg_pnl': round(sub['pnl_pct'].mean(), 2)
@@ -546,6 +580,7 @@ class BacktesterV2:
             'sl_rate': round(sl_rate, 1),
             'quality_stats': quality_stats,
             'dir_stats': dir_stats,
+            'regime_stats': regime_stats,
             'max_consec_losses': max_cl,
             'exit_counts': df['exit_reason'].value_counts().to_dict(),
             'final_equity': round(equity, 2),
@@ -555,46 +590,59 @@ class BacktesterV2:
     # ─────────────────────────────────────────────────────────
     #  Report
     # ─────────────────────────────────────────────────────────
-    def _format_report(self, s, pairs_tested, days,
-                       v1_wr=48.5, v1_worst=-21.35, v1_total=-3.5):
+    def _format_report(self, s, pairs_tested, days):
         wr_emoji = "🟢" if s['win_rate'] >= 55 else ("🟡" if s['win_rate'] >= 45 else "🔴")
 
         msg  = "═" * 38 + "\n"
-        msg += "📊 <b>BACKTEST V2 REPORT</b> 📊\n"
+        msg += "📊 <b>BACKTEST V3 REPORT</b> 📊\n"
         msg += "═" * 38 + "\n\n"
-        msg += f"🗓 Period: Last {days} days\n"
-        msg += f"📦 Pairs: {pairs_tested} | Trades: {s['total']}\n\n"
+
+        msg += "<b>⚙️ V3 SETTINGS</b>\n"
+        msg += f"  Threshold : {self.SCORE_THRESHOLD*100:.0f}%\n"
+        msg += f"  ATR cap   : {self.ATR_PCT_CAP*100:.0f}%\n"
+        msg += f"  Volume    : ${self.MIN_VOLUME_USDT/1e6:.0f}M\n"
+        msg += f"  SL mult   : {self.ATR_SL_MULT}x ATR\n"
+        msg += f"  Regime    : Soft bias (±{self.REGIME_BIAS_PTS}pts)\n\n"
+
+        msg += f"🗓 Period: {days} days | Pairs: {pairs_tested} | Trades: {s['total']}\n\n"
 
         msg += "━" * 38 + "\n"
-        msg += "<b>📈 V1 → V2 COMPARISON</b>\n"
+        msg += "<b>📈 V1 → V3 COMPARISON</b>\n"
         msg += "━" * 38 + "\n"
-        wr_delta = s['win_rate'] - v1_wr
-        wr_arrow = "⬆️" if wr_delta > 0 else "⬇️"
-        msg += f"Win Rate:   {v1_wr}% → {s['win_rate']}%  {wr_arrow} {wr_delta:+.1f}%\n"
-        msg += f"Worst SL:   {v1_worst}% → {s['worst_trade']}%\n"
-        msg += f"Expectancy: N/A → {s['expectancy']:+.3f}% per trade\n"
-        msg += f"$10k Equity: ??? → ${s['final_equity']:,.0f}\n\n"
+        wr_delta = s['win_rate'] - 48.5
+        msg += f"Win Rate:    48.5% → {s['win_rate']}%  ({wr_delta:+.1f}%)\n"
+        msg += f"Worst trade: -21.4% → {s['worst_trade']}%\n"
+        msg += f"Expectancy:  ??? → {s['expectancy']:+.3f}% per trade\n"
+        msg += f"$10k equity: ??? → ${s['final_equity']:,.0f}\n\n"
 
         msg += "━" * 38 + "\n"
-        msg += "<b>📊 FULL STATS</b>\n"
+        msg += f"<b>📊 PERFORMANCE</b>\n"
         msg += "━" * 38 + "\n"
-        msg += f"{wr_emoji} Win Rate: {s['win_rate']}%  ({s['wins']}W / {s['losses']}L)\n"
+        msg += f"{wr_emoji} Win Rate:  {s['win_rate']}%  ({s['wins']}W / {s['losses']}L)\n"
         msg += f"💰 Avg Win:  +{s['avg_win']}%\n"
         msg += f"💸 Avg Loss: {s['avg_loss']}%\n"
-        msg += f"⚖️  RR: {s['rr']}:1\n"
-        msg += f"🎯 Expectancy: {s['expectancy']:+.3f}%\n"
-        msg += f"📊 Total PnL: {s['total_pnl']:+.1f}%\n"
-        msg += f"🏆 Best: +{s['best_trade']}%\n"
-        msg += f"💀 Worst: {s['worst_trade']}%\n"
-        msg += f"⏱ Avg Hold: {s['avg_hold']}h\n\n"
+        msg += f"⚖️  RR:       {s['rr']}:1\n"
+        msg += f"🎯 Expect:   {s['expectancy']:+.3f}%\n"
+        msg += f"🏆 Best:     +{s['best_trade']}%\n"
+        msg += f"💀 Worst:    {s['worst_trade']}%\n"
+        msg += f"⏱ Avg hold: {s['avg_hold']}h\n\n"
 
         msg += "━" * 38 + "\n"
         msg += "<b>🎯 TP / SL RATES</b>\n"
         msg += "━" * 38 + "\n"
-        msg += f"  TP1: {s['tp1_rate']}%  TP2: {s['tp2_rate']}%  TP3: {s['tp3_rate']}%\n"
-        msg += f"  SL:  {s['sl_rate']}%  Max Consec Loss: {s['max_consec_losses']}\n\n"
+        msg += f"  TP1 {s['tp1_rate']}% | TP2 {s['tp2_rate']}% | TP3 {s['tp3_rate']}%\n"
+        msg += f"  SL  {s['sl_rate']}% | Max consec loss: {s['max_consec_losses']}\n\n"
 
-        if s['quality_stats']:
+        if s.get('regime_stats'):
+            msg += "━" * 38 + "\n"
+            msg += "<b>📡 BY BTC REGIME</b>\n"
+            msg += "━" * 38 + "\n"
+            for r, rs in s['regime_stats'].items():
+                e = "🟢" if r=='BULL' else ("🔴" if r=='BEAR' else "⚪")
+                msg += f"  {e} {r}: {rs['count']}t | WR {rs['wr']}% | Avg {rs['avg_pnl']:+.2f}%\n"
+            msg += "\n"
+
+        if s.get('quality_stats'):
             msg += "━" * 38 + "\n"
             msg += "<b>💎 BY QUALITY</b>\n"
             msg += "━" * 38 + "\n"
@@ -603,7 +651,7 @@ class BacktesterV2:
                 msg += f"  {e} {q}: {qs['count']}t | WR {qs['wr']}% | Avg {qs['avg_pnl']:+.2f}%\n"
             msg += "\n"
 
-        if s['dir_stats']:
+        if s.get('dir_stats'):
             msg += "━" * 38 + "\n"
             msg += "<b>📍 LONG vs SHORT</b>\n"
             msg += "━" * 38 + "\n"
@@ -613,7 +661,7 @@ class BacktesterV2:
             msg += "\n"
 
         msg += "━" * 38 + "\n"
-        msg += "<b>🚪 EXIT BREAKDOWN</b>\n"
+        msg += "<b>🚪 EXIT REASONS</b>\n"
         msg += "━" * 38 + "\n"
         for reason, count in s['exit_counts'].items():
             msg += f"  {reason}: {count} ({count/s['total']*100:.0f}%)\n"
@@ -623,13 +671,15 @@ class BacktesterV2:
         msg += "<b>🔬 VERDICT</b>\n"
         msg += "═" * 38 + "\n"
         if s['win_rate'] >= 60 and s['rr'] >= 1.5:
-            msg += "✅ <b>STRATEGY SOLID</b>\nGo live with small size!\n"
-        elif s['win_rate'] >= 55 and s['rr'] >= 1.2:
-            msg += "🟡 <b>GOOD IMPROVEMENT</b>\nMaybe filter PREMIUM only.\n"
+            msg += "🚀 <b>STRONG EDGE — GO LIVE SMALL SIZE</b>\n"
+        elif s['win_rate'] >= 55 and s['rr'] >= 1.3:
+            msg += "✅ <b>SOLID IMPROVEMENT — KEEP OPTIMIZING</b>\n"
+        elif s['win_rate'] >= 50 and s['rr'] >= 1.5:
+            msg += "🟡 <b>MARGINAL — HIGH RR SAVES IT</b>\n"
         elif s['win_rate'] >= 50:
-            msg += "🟡 <b>MARGINAL EDGE</b>\nConsider PREMIUM-only mode.\n"
+            msg += "🟡 <b>COIN FLIP — NEEDS MORE WORK</b>\n"
         else:
-            msg += "🔴 <b>NEEDS MORE WORK</b>\nShare results — will retweak.\n"
+            msg += "🔴 <b>STILL LOSING — SHARE LOGS, WILL RETWEAK</b>\n"
 
         msg += f"\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}"
         return msg
@@ -651,33 +701,30 @@ class BacktesterV2:
     #  MAIN
     # ─────────────────────────────────────────────────────────
     async def run(self):
-        logger.info("🚀 Backtester V2 starting...")
+        logger.info("🚀 Backtester V3 starting...")
         await self._send_telegram(
-            f"⏳ <b>Backtest V2 started</b>\n"
-            f"📦 {self.TOP_N_PAIRS} pairs × {self.LOOKBACK_DAYS} days\n"
-            f"🆕 All 5 fixes active:\n"
-            f"  ✅ ATR cap {self.ATR_PCT_CAP*100:.0f}%\n"
-            f"  ✅ Threshold {self.SCORE_THRESHOLD*100:.0f}%\n"
-            f"  ✅ Volume ${self.MIN_VOLUME_USDT/1e6:.0f}M\n"
-            f"  ✅ BTC regime filter\n"
-            f"  ✅ SL {self.ATR_SL_MULT}x ATR\n"
-            f"Takes ~75 mins..."
+            f"⏳ <b>Backtest V3 started</b>\n\n"
+            f"<b>Balanced settings:</b>\n"
+            f"  📊 Threshold : {self.SCORE_THRESHOLD*100:.0f}%\n"
+            f"  📉 ATR cap   : {self.ATR_PCT_CAP*100:.0f}%\n"
+            f"  💧 Volume    : ${self.MIN_VOLUME_USDT/1e6:.0f}M\n"
+            f"  🛑 SL mult   : {self.ATR_SL_MULT}x ATR\n"
+            f"  📡 Regime    : Soft bias\n\n"
+            f"~75 min runtime..."
         )
 
-        # FIX 4: Fetch BTC 4H data for regime analysis
-        logger.info("Fetching BTC 4H history for regime filter...")
-        self.btc_df_4h = await self._fetch_history(
-            'BTC/USDT:USDT', '4h', self.LOOKBACK_DAYS + 30
-        )
+        # Fetch BTC 4H for regime
+        logger.info("Fetching BTC 4H for regime filter...")
+        self.btc_df_4h = await self._fetch_history('BTC/USDT:USDT', '4h', self.LOOKBACK_DAYS + 30)
         if self.btc_df_4h is not None:
             logger.info(f"✅ BTC 4H: {len(self.btc_df_4h)} candles")
         else:
-            logger.warning("⚠️ Could not fetch BTC 4H — regime filter disabled")
+            logger.warning("⚠️ BTC 4H fetch failed — regime disabled")
 
         pairs = await self._get_top_pairs()
         logger.info(f"📋 Testing {len(pairs)} pairs")
 
-        all_trades    = []
+        all_trades     = []
         pair_summaries = []
 
         for i, symbol in enumerate(pairs):
@@ -691,7 +738,7 @@ class BacktesterV2:
                 if any(x is None for x in [df_1h, df_4h, df_15m]):
                     continue
                 if len(df_1h) < 120:
-                    logger.info(f"  ⚠️ Not enough data")
+                    logger.info(f"  ⚠️ Not enough 1H data")
                     continue
 
                 trades = self._walk_forward(symbol, df_1h, df_4h, df_15m)
@@ -714,20 +761,23 @@ class BacktesterV2:
         logger.info(f"🏁 Done. {len(all_trades)} trades across {len(pair_summaries)} pairs.")
 
         if not all_trades:
-            await self._send_telegram("❌ No trades found. Filters may be too strict — try loosening ATR cap or threshold.")
+            await self._send_telegram(
+                "❌ Still 0 trades. Something structural is wrong.\n"
+                "Share terminal logs — I'll diagnose it directly."
+            )
             await self.exchange.close()
             return
 
-        pd.DataFrame(all_trades).to_csv('/tmp/backtest_v2_results.csv', index=False)
-        logger.info("💾 Saved /tmp/backtest_v2_results.csv")
+        pd.DataFrame(all_trades).to_csv('/tmp/backtest_v3_results.csv', index=False)
+        logger.info("💾 Saved /tmp/backtest_v3_results.csv")
 
         stats  = self._compute_stats(all_trades)
         report = self._format_report(stats, len(pairs), self.LOOKBACK_DAYS)
         await self._send_telegram(report)
 
         if pair_summaries:
-            psum   = sorted(pair_summaries, key=lambda x: x['pnl'], reverse=True)
-            extra  = "\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            psum  = sorted(pair_summaries, key=lambda x: x['pnl'], reverse=True)
+            extra = "\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
             extra += "<b>🏆 TOP 5 PAIRS</b>\n"
             for p in psum[:5]:
                 extra += f"  {p['symbol']}: {p['trades']}t | WR {p['wr']}% | {p['pnl']:+.1f}%\n"
@@ -737,25 +787,21 @@ class BacktesterV2:
             await self._send_telegram(extra)
 
         await self.exchange.close()
-        logger.info("✅ Backtest V2 complete!")
+        logger.info("✅ Backtester V3 complete!")
         return stats
 
 
-# ════════════════════════════════════════════════════════
-#  RUN:  python backtester_v2.py
-# ════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════
+#  RUN:  python backtester_v3.py
+# ════════════════════════════════════════════════════
 async def main():
     TELEGRAM_TOKEN   = "8034062612:AAEJYbPA8sMODYvqvt8U-5mM7c3Y3-GOYtM"
     TELEGRAM_CHAT_ID = "7500072234"
 
-    bt = BacktesterV2(
+    bt = BacktesterV3(
         telegram_token=TELEGRAM_TOKEN,
         telegram_chat_id=TELEGRAM_CHAT_ID
     )
-
-    # Tweak these if you want
-    bt.LOOKBACK_DAYS  = 60
-    bt.TOP_N_PAIRS    = 30
 
     await bt.run()
 
