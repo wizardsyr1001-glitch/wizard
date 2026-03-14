@@ -2,7 +2,5 @@ ccxt
 python-telegram-bot
 pandas
 numpy
-asyncio
-aiohttp
-python-dotenv
 ta
+aiohttp
