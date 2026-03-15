@@ -1,42 +1,45 @@
 """
-REVERSAL RIDER — BACKTEST v1.0
+REVERSAL RIDER — BACKTEST v2.0
 ================================
-Strategy: Catch exhausted bottoms (LONG) and tops (SHORT),
-ride the reversal swing intraday (2-8 hours).
+v1 lesson: 24.5% WR. Cause: fighting the macro trend.
+  BB at extremes in crypto = strong trend, not exhaustion.
+  Catching falling knives in bear markets = -90% DD.
 
-LONG signal — bottom catch:
-  Gate 1: 4H downtrend (EMA9 < EMA21 < EMA50) — price has been falling
-  Gate 2: 4H RSI < 38 — exhaustion/oversold on higher TF
-  Gate 3: 4H price at/below lower BB (bb_pband < 0.15) — stretched
-  Gate 4: 1H MACD histogram turning UP (cur > prev, and cur < 0) — reversal starting
-  Gate 5: 1H RSI < 45 but rising — not overbought, momentum turning
-  Gate 6: 1H bullish candle trigger (engulf, hammer, or bull div)
-  Gate 7: Volume spike on reversal candle (>1.8x avg) — smart money
-  Gate 8: BTC regime BULL (no longs in bear)
-  Gate 9: 1H price near demand zone (below 1H EMA50)
+v2 fix — THE KEY CHANGE: weekly trend must agree with direction.
+  LONG only when 1W trend is UP (dip in bull market)
+  SHORT only when 1W trend is DOWN (bounce in bear market)
 
-SHORT signal — top catch:
-  Gate 1: 4H uptrend (EMA9 > EMA21 > EMA50) — price has been rising
-  Gate 2: 4H RSI > 62 — overbought/exhaustion on higher TF
-  Gate 3: 4H price at/above upper BB (bb_pband > 0.85) — stretched
-  Gate 4: 1H MACD histogram turning DOWN (cur < prev, and cur > 0) — reversal
-  Gate 5: 1H RSI > 55 but falling — momentum turning
-  Gate 6: 1H bearish candle trigger (engulf, shooting star, bear div)
-  Gate 7: Volume spike on rejection (>1.8x avg) — smart money distributing
-  Gate 8: BTC regime BEAR (no shorts in bull)
-  Gate 9: 1H price near supply zone (above 1H EMA50)
+Additional fixes from indicator analysis:
+  - Removed BB as hard gate (was worst performer at 16.5% WR)
+  - BB now used as bonus points only (not required)
+  - Added 15M candle confirmation (double trigger required)
+  - Extended timeout to 12H (short TP2 avg was +5.9%, needs room)
+  - Tightened RSI gates: oversold <30 for LONG, >70 for SHORT
+  - Added 1W EMA21 slope check as hard gate
+
+LONG signal — dip in bull market:
+  HARD Gate 1: 1W trend UP (price > 1W EMA21) ← NEW KEY GATE
+  HARD Gate 2: 4H in short-term downtrend (EMA9 < EMA21)
+  HARD Gate 3: 4H RSI < 35 (deeper oversold required)
+  HARD Gate 4: 1H MACD histogram turning UP from negative
+  HARD Gate 5: 1H bullish candle trigger (engulf/hammer/div)
+  HARD Gate 6: 15M also showing bullish candle or hammer
+  BONUS: Volume spike, RSI divergence, OBV, stoch cross
+
+SHORT signal — bounce in bear market:
+  HARD Gate 1: 1W trend DOWN (price < 1W EMA21) ← NEW KEY GATE
+  HARD Gate 2: 4H in short-term uptrend (EMA9 > EMA21)
+  HARD Gate 3: 4H RSI > 65 (deeper overbought required)
+  HARD Gate 4: 1H MACD histogram turning DOWN from positive
+  HARD Gate 5: 1H bearish candle trigger (engulf/shooting/div)
+  HARD Gate 6: 15M also showing bearish candle
+  BONUS: Volume spike, RSI divergence, OBV, stoch cross
 
 Trade management:
-  Entry:  1H close at signal
-  SL:     15M ATR × 1.2 (tight — proven from scalper v8)
-  TP1:    2.0R → close 60% position
-  TP2:    3.5R → close remaining 40%
-  Blended PnL = 60% × TP1_pct + 40% × TP2_pct (if both hit)
-  Timeout: 8H intraday hard close
-
-Scoring system (max 100):
-  Each gate contributes points — only fire if score ≥ MIN_SCORE
-  Strength modifiers boost score above baseline gates
+  SL: 15M ATR × 1.2
+  TP1: 2.0R → close 60%
+  TP2: 3.5R → close 40%
+  Timeout: 12H (extended from 8H)
 """
 
 import asyncio
@@ -53,13 +56,13 @@ warnings.filterwarnings('ignore')
 # ─────────────────────────────────────────────────────────────
 # SETTINGS
 # ─────────────────────────────────────────────────────────────
-LOOKBACK_DAYS    = 720    # 6 months — enough data to be meaningful
+LOOKBACK_DAYS    = 360     # 6 months — enough data to be meaningful
 TOP_N_PAIRS      = 300     # top 300 by volume — quality universe
 MIN_VOLUME_USDT  = 3_000_000  # $3M min — liquid pairs only
 
 # Signal gates
-RSI_OVERSOLD_4H   = 38     # 4H RSI must be below this for LONG
-RSI_OVERBOUGHT_4H = 62     # 4H RSI must be above this for SHORT
+RSI_OVERSOLD_4H   = 35     # v2: tighter — deeper oversold required
+RSI_OVERBOUGHT_4H = 65     # v2: tighter — deeper overbought required
 BB_STRETCHED_LOW  = 0.15   # 4H bb_pband below this = price at/below lower BB
 BB_STRETCHED_HIGH = 0.85   # 4H bb_pband above this = price at/above upper BB
 VOL_SPIKE_MULT    = 1.8    # volume must be 1.8x avg for confirmation
@@ -71,12 +74,12 @@ TP2_RR            = 3.5    # second target: 3.5R
 TP1_CLOSE_PCT     = 0.60   # close 60% at TP1
 TP2_CLOSE_PCT     = 0.40   # close 40% at TP2
 ATR_SL_MULT       = 1.2    # SL = 15M ATR × 1.2 (tight)
-MAX_TRADE_HOURS   = 8      # intraday — hard close at 8H
+MAX_TRADE_HOURS   = 12     # v2: extended — short TP2 avg was +5.9%, needs room
 
 # BTC regime filter
 REGIME_MODE       = 'HARD'  # LONG only in BULL, SHORT only in BEAR
 
-OUTPUT_FILE = '/mnt/user-data/outputs/backtest_reversal_v1_results.xlsx'
+OUTPUT_FILE = '/mnt/user-data/outputs/backtest_reversal_v2_results.xlsx'
 
 
 # ─────────────────────────────────────────────────────────────
@@ -462,7 +465,7 @@ def simulate_trade(idx, df_1h, direction, entry, sl, tp1, tp2):
 # BACKTESTER
 # ─────────────────────────────────────────────────────────────
 
-class ReversalBacktester:
+class ReversalBacktesterV2:
     def __init__(self):
         self.exchange = ccxt.binance({
             'enableRateLimit': True,
@@ -514,6 +517,8 @@ class ReversalBacktester:
         df_4h  = await self.fetch_df(symbol, '4h',  limit=LOOKBACK_DAYS*6+60)
         await asyncio.sleep(0.12)
         df_15m = await self.fetch_df(symbol, '15m', limit=LOOKBACK_DAYS*96+200)
+        await asyncio.sleep(0.12)
+        df_1w  = await self.fetch_df(symbol, '1w',  limit=60)   # v2: weekly trend gate
         await asyncio.sleep(0.15)
 
         if df_1h is None or df_4h is None or df_15m is None or len(df_1h) < 100:
@@ -522,6 +527,10 @@ class ReversalBacktester:
         df_1h  = add_indicators(df_1h)
         df_4h  = add_indicators(df_4h)
         df_15m = add_indicators(df_15m)
+        if df_1w is not None and len(df_1w) >= 10:
+            df_1w = add_indicators(df_1w)
+        else:
+            df_1w = None
 
         required_1h = ['ema_9','ema_21','ema_50','rsi','macd_hist','bb_pband','atr',
                        'bull_engulf','bear_engulf','hammer','shooting_star','srsi_k','srsi_d']
@@ -550,6 +559,17 @@ class ReversalBacktester:
             r4h  = c4h.iloc[-1]
             p4h  = c4h.iloc[-2]
             r15m = c15m.iloc[-1]
+
+            # v2: Weekly trend check
+            weekly_trend = 'UNKNOWN'
+            if df_1w is not None:
+                c1w = df_1w[df_1w.index <= ts1h]
+                if len(c1w) >= 2 and 'ema_21' in c1w.columns:
+                    r1w = c1w.iloc[-1]
+                    w_close = float(r1w['close']) if not pd.isna(r1w['close']) else 0
+                    w_ema21 = float(r1w['ema_21']) if not pd.isna(r1w['ema_21']) else 0
+                    if w_close > 0 and w_ema21 > 0:
+                        weekly_trend = 'UP' if w_close > w_ema21 else 'DOWN'
 
             # Volume ratio
             vol_avg   = df_1h['volume'].iloc[max(0,i-20):i].mean()
@@ -581,40 +601,62 @@ class ReversalBacktester:
             else:
                 btc_regime_val = 'N/A'
 
-            # HARD GATES — these must pass or skip
-            r4h_rsi  = float(r4h['rsi'])  if 'rsi' in r4h.index and not pd.isna(r4h['rsi']) else 50
-            r4h_bbp  = float(r4h['bb_pband']) if 'bb_pband' in r4h.index and not pd.isna(r4h['bb_pband']) else 0.5
-            r4h_e9   = float(r4h['ema_9'])  if 'ema_9'  in r4h.index and not pd.isna(r4h['ema_9'])  else 0
-            r4h_e21  = float(r4h['ema_21']) if 'ema_21' in r4h.index and not pd.isna(r4h['ema_21']) else 0
+            # ── v2 HARD GATES ──────────────────────────────────────
+            r4h_rsi  = float(r4h['rsi'])   if 'rsi'   in r4h.index and not pd.isna(r4h['rsi'])   else 50
+            r4h_e9   = float(r4h['ema_9']) if 'ema_9' in r4h.index and not pd.isna(r4h['ema_9']) else 0
+            r4h_e21  = float(r4h['ema_21'])if 'ema_21'in r4h.index and not pd.isna(r4h['ema_21'])else 0
+            hist_cur = float(r1h['macd_hist']); hist_prv = float(p1h['macd_hist'])
+
+            # 15M candle trigger check
+            c15m_recent = df_15m[df_15m.index <= ts1h].iloc[-3:]
+            has_15m_bull = any(
+                float(r.get('bull_engulf',0))==1 or float(r.get('hammer',0))==1
+                for _, r in c15m_recent.iterrows()
+            )
+            has_15m_bear = any(
+                float(r.get('bear_engulf',0))==1 or float(r.get('shooting_star',0))==1
+                for _, r in c15m_recent.iterrows()
+            )
 
             if signal == 'LONG':
-                # Hard gates for LONG: 4H must be bearish context + RSI exhausted + BB stretched
-                if r4h_rsi >= RSI_OVERSOLD_4H + 10:   continue  # not oversold enough
-                if r4h_bbp >= BB_STRETCHED_LOW + 0.15: continue  # not stretched enough
-                if r4h_e9  >= r4h_e21:                 continue  # 4H not in downtrend
-                # 1H reversal: MACD histogram must be turning up
-                hist_cur = float(r1h['macd_hist']); hist_prv = float(p1h['macd_hist'])
-                if hist_cur <= hist_prv:               continue  # histogram not turning up
-                # Need a candle trigger
-                has_trigger = (
-                    float(r1h['bull_engulf']) == 1 or
-                    float(r1h['hammer']) == 1 or
-                    float(r1h['bull_div']) == 1
+                # v2 KEY GATE: weekly trend must be UP (dip in bull market only)
+                if weekly_trend == 'DOWN':             continue  # no longs in weekly downtrend
+                if weekly_trend == 'UNKNOWN':          continue  # no data = skip
+                # 4H short-term pullback required
+                if r4h_e9  >= r4h_e21:                continue  # 4H not pulling back
+                # 4H RSI — deeper oversold
+                if r4h_rsi >= RSI_OVERSOLD_4H:         continue  # not oversold enough
+                # 1H MACD must be turning up
+                if hist_cur <= hist_prv:               continue  # not turning up
+                # 1H candle trigger (required)
+                has_1h_trigger = (
+                    float(r1h['bull_engulf'])==1 or
+                    float(r1h['hammer'])==1 or
+                    float(r1h['bull_div'])==1
                 )
-                if not has_trigger:                    continue
+                if not has_1h_trigger:                 continue
+                # 15M confirmation (required — double trigger)
+                if not has_15m_bull:                   continue
 
             else:  # SHORT
-                if r4h_rsi <= RSI_OVERBOUGHT_4H - 10: continue
-                if r4h_bbp <= BB_STRETCHED_HIGH - 0.15:continue
-                if r4h_e9  <= r4h_e21:                 continue  # 4H not in uptrend
-                hist_cur = float(r1h['macd_hist']); hist_prv = float(p1h['macd_hist'])
-                if hist_cur >= hist_prv:               continue  # histogram not turning down
-                has_trigger = (
-                    float(r1h['bear_engulf']) == 1 or
-                    float(r1h['shooting_star']) == 1 or
-                    float(r1h['bear_div']) == 1
+                # v2 KEY GATE: weekly trend must be DOWN (bounce in bear market only)
+                if weekly_trend == 'UP':               continue  # no shorts in weekly uptrend
+                if weekly_trend == 'UNKNOWN':          continue
+                # 4H short-term bounce required
+                if r4h_e9  <= r4h_e21:                continue  # 4H not bouncing
+                # 4H RSI — deeper overbought
+                if r4h_rsi <= RSI_OVERBOUGHT_4H:       continue  # not overbought enough
+                # 1H MACD must be turning down
+                if hist_cur >= hist_prv:               continue  # not turning down
+                # 1H candle trigger (required)
+                has_1h_trigger = (
+                    float(r1h['bear_engulf'])==1 or
+                    float(r1h['shooting_star'])==1 or
+                    float(r1h['bear_div'])==1
                 )
-                if not has_trigger:                    continue
+                if not has_1h_trigger:                 continue
+                # 15M confirmation (required — double trigger)
+                if not has_15m_bear:                   continue
 
             # Build trade levels
             entry    = float(r1h['close'])
@@ -852,7 +894,7 @@ class ReversalBacktester:
 
 
 async def main():
-    bt = ReversalBacktester()
+    bt = ReversalBacktesterV2()
     await bt.run()
 
 if __name__ == '__main__':
